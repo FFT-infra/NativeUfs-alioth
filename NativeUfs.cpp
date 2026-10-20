@@ -1007,6 +1007,12 @@ struct StoreGeometry {
 };
 StoreGeometry gStoreGeometry;
 uint64_t gStoreRegionFirst, gStoreRegionBlocks;
+// The diagnostic log (sheng-log=1): always the last 32 MiB of userdata, so the Data store's place does not depend on logging.
+constexpr uint64_t kLogReserveBlocks = 8192;
+// The log's export region: the 256 MiB just below the log window (the render server's pipeline caches, kits/sheng BootLog.c). It is
+// part of the log's write window, so the store ends below both.
+constexpr uint64_t kExportBlocks = 65536;
+uint64_t gLogRegionFirst, gLogRegionBlocks;
 
 static unsigned storeMode (void)
 {
@@ -1034,9 +1040,11 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
     if (!blocks || blocks > partition / 4) reason = "size";
-    else if (partition - blocks < imageBlocks + 1024) reason = "overlaps the root image";
+    else if (partition - blocks - kLogReserveBlocks - kExportBlocks < imageBlocks + 1024) reason = "overlaps the root image";
     else {
-      uint64_t first = gStoreGeometry.last + 1 - blocks;
+      // The last kLogReserveBlocks of the partition belong to the diagnostic log and the kExportBlocks below them to its export region;
+      // the store ends just below both.
+      uint64_t first = gStoreGeometry.last + 1 - kLogReserveBlocks - kExportBlocks - blocks;
       if (storeMode () == 2 && !hostStoreOpen (first, blocks)) reason = "window refused";
       else {
         gStoreRegionFirst = first;
@@ -1080,6 +1088,85 @@ extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void
 extern "C" int native_ufs_store_sync (void)
 {
   return storeMode () == 2 && gStoreRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+}
+
+// ---- Diagnostic log window (sheng-log=1) --------------------------------------------------------------------------
+// The board's log writer (kits/sheng BootLog.c) gets the last kLogReserveBlocks of userdata and the kExportBlocks below them, refused
+// unless the partition holds them clear of the flashed root image plus a 4 MiB guard. Off without the boot argument.
+static unsigned logMode (void)
+{
+  static int cached = -1;
+  if (cached < 0) {
+    uint32_t value = 0;
+    if (!PE_parse_boot_argn ("sheng-log", &value, sizeof (value)) || value > 1) value = 0;
+    cached = static_cast<int> (value);
+  }
+  return static_cast<unsigned> (cached);
+}
+
+// Returns 1 with the window's first absolute LBA and size in 4096-byte blocks, 0 on refusal (reason in *why, may be null).
+extern "C" int native_ufs_log_open (uint64_t *firstLba, uint64_t *blocks, const char **why)
+{
+  const char *reason = "";
+  int ok = 0;
+  if (!logMode ()) reason = "off";
+  else if (!gStoreGeometry.valid || !gHost.ready) reason = "no root layout";
+  else if (gLogRegionBlocks) reason = "already open";
+  else {
+    uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
+    uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
+    if (partition < (kLogReserveBlocks + kExportBlocks) * 4 || partition - kLogReserveBlocks - kExportBlocks < imageBlocks + 1024)
+      reason = "overlaps the root image";
+    else {
+      uint64_t first = gStoreGeometry.last + 1 - kLogReserveBlocks;
+      // One write window covers the export region and the log: [first - kExportBlocks, first + kLogReserveBlocks).
+      if (!hostLogOpen (first - kExportBlocks, kExportBlocks + kLogReserveBlocks)) reason = "window refused";
+      else {
+        gLogRegionFirst = first;
+        gLogRegionBlocks = kLogReserveBlocks;
+        if (firstLba) *firstLba = first;
+        if (blocks) *blocks = kLogReserveBlocks;
+        ok = 1;
+      }
+    }
+  }
+  if (why) *why = reason;
+  return ok;
+}
+
+extern "C" int native_ufs_log_write (uint64_t rel, uint32_t blocks, const void *src)
+{
+  if (!gLogRegionBlocks || !src || !blocks || rel >= gLogRegionBlocks || blocks > gLogRegionBlocks - rel) return 0;
+  while (blocks) {
+    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    if (hostWrite4k (0, gLogRegionFirst + rel, chunk, src) != kIOReturnSuccess) return 0;
+    src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
+    rel += chunk;
+    blocks -= chunk;
+  }
+  return 1;
+}
+
+// The export region below the log window: its size in blocks once the log is open, else 0; writes at a block offset inside it.
+extern "C" uint64_t native_ufs_export_blocks (void) { return gLogRegionBlocks ? kExportBlocks : 0; }
+
+extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const void *src)
+{
+  if (!gLogRegionBlocks || !src || !blocks || rel >= kExportBlocks || blocks > kExportBlocks - rel) return 0;
+  const uint64_t base = gLogRegionFirst - kExportBlocks;
+  while (blocks) {
+    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    if (hostWrite4k (0, base + rel, chunk, src) != kIOReturnSuccess) return 0;
+    src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
+    rel += chunk;
+    blocks -= chunk;
+  }
+  return 1;
+}
+
+extern "C" int native_ufs_log_sync (void)
+{
+  return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
 }
 
 // Re-read the GPT header and entry array and compare their CRCs with what was recorded at root start. 0 = unchanged.

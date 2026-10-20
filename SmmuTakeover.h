@@ -17,8 +17,9 @@ static unsigned ufsSmmuAddressBits(unsigned code)
     default: return 0;
   }
 }
+// One attempt with a given context bank (counted from the top). The caller falls back to lower banks when this one is held by another stream.
 template <class Read>
-static UfsSmmuPlan planUfsSmmu(uint16_t stream, uint64_t dma, uint64_t bytes, Read read)
+static UfsSmmuPlan planUfsSmmuBank(uint16_t stream, uint64_t dma, uint64_t bytes, Read read, unsigned bankFromTop)
 {
   UfsSmmuPlan p;
   uint32_t idr0 = read(0x20), idr2 = read(0x28);
@@ -40,7 +41,8 @@ static UfsSmmuPlan planUfsSmmu(uint16_t stream, uint64_t dma, uint64_t bytes, Re
     p.error = "unsupported SMMU geometry"; return p;
   }
   if (count > 128) count = 128; // Firmware's reliably accessible groups only.
-  p.bank = banks - 1;
+  if (bankFromTop >= banks - 1) {p.error = "no free context bank"; return p;}
+  p.bank = banks - 1 - bankFromTop;
   unsigned matches = 0;
   for (unsigned i = 0; i < count; ++i) {
     uint32_t smr = read(0x800 + 4 * i);
@@ -71,6 +73,30 @@ static UfsSmmuPlan planUfsSmmu(uint16_t stream, uint64_t dma, uint64_t bytes, Re
   }
   if (p.slot == 0xffffffffU) p.error = "no free stream-match group";
   return p;
+}
+
+// The UFS stream's context bank: the top bank first. A stream mapping left behind by an earlier run (or by another OS that used the SMMU before a
+// warm reset) can still point another stream at that bank; rather than refuse to boot, the next banks down are tried, each held to the same checks
+// (no other valid stream maps it, translation off). Any other refusal (a conflicting mapping of our own stream, no free group, unsupported geometry)
+// is final and is reported as the first attempt saw it.
+template <class Read>
+static UfsSmmuPlan planUfsSmmu(uint16_t stream, uint64_t dma, uint64_t bytes, Read read)
+{
+  enum {kBankAttempts = 8};
+  UfsSmmuPlan first = planUfsSmmuBank(stream, dma, bytes, read, 0);
+  if (!first.error) return first;
+  // "conflicting" is retried too: our own stream may already sit on a lower bank from an earlier run that had to fall back.
+  auto retryable = [](const char *e) {
+    return !__builtin_strcmp(e, "reserved context bank already used") || !__builtin_strcmp(e, "reserved context bank not bypass") ||
+           !__builtin_strcmp(e, "conflicting UFS stream mapping");
+  };
+  if (!retryable(first.error)) return first;
+  for (unsigned attempt = 1; attempt < kBankAttempts; ++attempt) {
+    UfsSmmuPlan next = planUfsSmmuBank(stream, dma, bytes, read, attempt);
+    if (!next.error) return next;
+    if (!retryable(next.error)) break;
+  }
+  return first;
 }
 
 // The caller must first quiesce the UFS queue. The planner refuses other

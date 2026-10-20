@@ -256,27 +256,43 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   return status;
 }
 
-// ---- Persistent store window -------------------------------------------------------------------------------------
-// The only place this driver writes. One window of 4096-byte LBAs on LUN 0 is opened once, by the store integration, after
-// it has proved that the window lies inside the userdata partition and clear of the root image; every write is checked
-// against it again here, so nothing outside it can be written even if a caller is wrong.
-static bool gStoreOpen = false;
-static uint64_t gStoreFirst = 0, gStoreBlocks = 0;
+// ---- Persistent store and log windows ------------------------------------------------------------------------------
+// The only place this driver writes. At most two windows of 4096-byte LBAs on LUN 0 (the Data store and the diagnostic log),
+// each opened once by its integration after it has proved that the window lies inside the userdata partition and clear of the
+// root image; every write is checked against them again here, so nothing outside them can be written even if a caller is wrong.
+static bool gStoreOpen = false, gLogOpen = false;
+static uint64_t gStoreFirst = 0, gStoreBlocks = 0, gLogFirst = 0, gLogBlocks = 0;
+
+static bool hostLogOpen (uint64_t first, uint64_t blocks)
+{
+  if (gLogOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
+  if (gStoreOpen && first < gStoreFirst + gStoreBlocks && gStoreFirst < first + blocks) return false;
+  gLogFirst = first;
+  gLogBlocks = blocks;
+  gLogOpen = true;
+  return true;
+}
+
+static bool hostInWindow (uint64_t lba, uint32_t blocks)
+{
+  if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
+  return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
+}
 
 static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 {
   if (gStoreOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
+  if (gLogOpen && first < gLogFirst + gLogBlocks && gLogFirst < first + blocks) return false;
   gStoreFirst = first;
   gStoreBlocks = blocks;
   gStoreOpen = true;
   return true;
 }
 
-// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside the store window.
+// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
 static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !gStoreOpen ||
-      lba < gStoreFirst || lba - gStoreFirst >= gStoreBlocks || blocks > gStoreBlocks - (lba - gStoreFirst)) {
+  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
   }
   IOLockLock (gHost.lock);
@@ -293,7 +309,7 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
 static IOReturn hostSyncCache (void)
 {
-  if (!gHost.ready || !gStoreOpen) return kIOReturnNotReady;
+  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;

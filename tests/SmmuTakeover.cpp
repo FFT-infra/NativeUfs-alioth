@@ -16,11 +16,20 @@ int main()
   r[(0x1000+4*69)/4]=0x10000;
   p=plan(); assert(!p.error && p.reuse && p.slot==110);
   r[(0x800+4*111)/4]=0x80000060; r[(0xc00+4*111)/4]=69; assert(plan().error);
-  reset(); r[0x800/4]=0x80000061; r[0xc00/4]=69; assert(plan().error);
+  // Another stream still pointing at the top bank (a mapping left by an earlier run): the plan moves to the next free bank down.
+  reset(); r[0x800/4]=0x80000061; r[0xc00/4]=69; p=plan(); assert(!p.error && !p.reuse && p.bank==68 && p.slot==127);
+  // The next banks may be held too, or translating: each is skipped; with every attempt blocked the first refusal is reported.
+  reset(); r[0x800/4]=0x80000061; r[0xc00/4]=69; r[0x804/4]=0x80000062; r[0xc04/4]=68; r[(128+67)*4096/4]=1; p=plan(); assert(!p.error && p.bank==66);
+  reset(); for(unsigned k=0;k<8;++k){r[(0x800+4*k)/4]=0x80000100+k;r[(0xc00+4*k)/4]=69-k;}
+  p=plan(); assert(p.error && !__builtin_strcmp(p.error,"reserved context bank already used") && p.bank==69);
   reset(); r[0x800/4]=0x80000060; r[0xc00/4]=1; assert(plan().error);
+  // Our stream already mapped to the fallback bank by an earlier run (the top bank held by another stream): reused, not refused.
+  reset(); r[0x800/4]=0x80000061; r[0xc00/4]=69; r[0x804/4]=0x80000060; r[0xc04/4]=68; r[(0x1000+4*68)/4]=0x10000;
+  p=plan(); assert(!p.error && p.reuse && p.bank==68 && p.slot==1);
   reset(); r[0x800/4]=0x80010060; r[0xc00/4]=69; assert(plan().error);
   reset(); r[0x800/4]=0x80008060; r[0xc00/4]=1; assert(!plan().error); // Distinct 16-bit SID.
-  reset(); r[(128+69)*4096/4]=1; assert(plan().error);
+  reset(); r[(128+69)*4096/4]=1; p=plan(); assert(!p.error && p.bank==68); // translating top bank: use the next one
+  reset(); for(unsigned k=0;k<8;++k) r[(128+69-k)*4096/4]=1; assert(plan().error);
   reset(); r[0x24/4]|=0x80000000; assert(plan().error); // Never guess 64K register geometry.
   reset(); for(unsigned i=0;i<128;++i) {r[(0x800+4*i)/4]=0x80000100+i;r[(0xc00+4*i)/4]=1;}
   assert(plan().error);

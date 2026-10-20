@@ -31,6 +31,8 @@ def main():
     parser.add_argument('--linker',default='ld.lld')
     args=parser.parse_args()
     out=args.output.resolve(); out.mkdir(parents=True,exist_ok=True)
+    if shutil.disk_usage(out).free < 5*1024**3+512*1024**2:
+        raise SystemExit('Keep 5 GiB free plus fixture headroom')
     source=Path(__file__).resolve().parent
     production=source.parent/'NativeUfs.cpp'
     extracted='\n'.join(extract(production.read_text(),name) for name in
