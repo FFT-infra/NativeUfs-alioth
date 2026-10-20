@@ -1,5 +1,7 @@
 # NativeUfs
 
-Native UFS storage driver.
+Native UFS storage driver. Owns the host controller, SMMU, queues and the root read path.
 
-Maintained as an independent module and included by [UniXNU](https://github.com/UniXNU/UniXNU) at `drivers/NativeUfs`.
+Current state: provides the native UFS root on sheng.
+
+Linked into XNU by `unixnu build kernel`.
