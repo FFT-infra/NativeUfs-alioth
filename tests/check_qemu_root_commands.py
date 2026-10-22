@@ -37,6 +37,8 @@ lib.ufs_test_query.argtypes = [C.c_uint8, C.c_uint8, C.POINTER(C.c_uint32)]
 lib.ufs_test_query.restype = C.c_uint32
 lib.ufs_test_scsi.argtypes = [C.c_uint8,C.c_void_p,C.c_uint,C.c_bool,C.c_uint32,C.POINTER(C.c_uint32)]
 lib.ufs_test_scsi.restype = C.c_uint32
+lib.ufs_test_capacity.argtypes = [C.c_uint8,C.POINTER(C.c_uint32),C.POINTER(C.c_uint32),C.POINTER(C.c_uint32),C.POINTER(C.c_uint32)]
+lib.ufs_test_capacity.restype = C.c_uint32
 lib.ufs_test_read.argtypes = [C.c_uint8,C.c_uint64,C.c_uint32,C.c_void_p]
 lib.ufs_test_read.restype = C.c_uint32
 lib.ufs_test_poisoned.restype = C.c_bool
@@ -157,6 +159,11 @@ with tempfile.TemporaryDirectory(prefix='ufs-qtest-') as td:
                     if result == 0: break
                     assert result == 0xe00002d8 and status.value in (2,0x102), (hex(result),hex(status.value),errors)
                 assert result == 0, 'TUR did not become ready'
+                capacity_last,capacity_bytes,capacity_scsi,capacity_ocs=(C.c_uint32(),C.c_uint32(),C.c_uint32(),C.c_uint32())
+                assert lib.ufs_test_capacity(0,C.byref(capacity_last),C.byref(capacity_bytes),
+                    C.byref(capacity_scsi),C.byref(capacity_ocs)) == 0, 'READ CAPACITY failed'
+                assert (capacity_last.value,capacity_bytes.value,capacity_scsi.value,capacity_ocs.value)==(511,4096,0,0), \
+                    'Unexpected READ CAPACITY result'
                 for blocks in (1, 32):
                     buffer = (C.c_uint8 * (blocks * 4096))()
                     assert lib.ufs_test_read(0, 384, blocks, buffer) == 0, 'READ(10) failed'
@@ -191,7 +198,9 @@ with tempfile.TemporaryDirectory(prefix='ufs-qtest-') as td:
                 assert lib.ufs_test_write(0, 480, 1, logblock) == 0 and lib.ufs_test_write(0, 495, 1, logblock) == 0, 'Log window refused'
                 assert lib.ufs_test_sync() == 0
                 assert not lib.ufs_test_poisoned() and not errors, errors
-                results.append({'dma': hex(physical), 'nop': 'pass', 'power_query': value.value, 'store_window': 'pass',
+                results.append({'dma': hex(physical), 'nop': 'pass', 'power_query': value.value,
+                    'read_capacity': {'last_lba': capacity_last.value, 'block_bytes': capacity_bytes.value},
+                    'store_window': 'pass',
                     'root_path': path_result, 'read_4k': 'pass', 'read_128k': 'pass', 'bad_lba_no_copy': 'pass'})
         finally:
             process.terminate()

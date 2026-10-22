@@ -208,6 +208,36 @@ static IOReturn hostScsi (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, b
   return hostScsiDir (lun, cdb, cdbLength, dataBytes ? 2U : 0U, dataBytes, timeoutUs, scsiStatus);
 }
 
+struct UfsReadCapacity {
+  uint32_t lastLba;
+  uint32_t blockBytes;
+  uint32_t scsi;
+  uint32_t ocs;
+};
+
+// SCSI READ CAPACITY(10). This reports the device's last addressable LBA and
+// logical block size without modifying storage.
+static IOReturn hostReadCapacity (uint8_t lun, UfsReadCapacity *capacity)
+{
+  if (!capacity || !gHost.ready) return kIOReturnBadArgument;
+  capacity->lastLba = 0;
+  capacity->blockBytes = 0;
+  capacity->scsi = 0xffff;
+  capacity->ocs = 0xff;
+  IOLockLock (gHost.lock);
+  uint8_t cdb[10] = { 0x25 };
+  uint32_t scsi = 0;
+  IOReturn status = hostScsi (lun, cdb, 10, true, 8, 1000000, &scsi);
+  capacity->scsi = scsi;
+  capacity->ocs = gRootDiagnostic.ocs;
+  if (status == kIOReturnSuccess) {
+    capacity->lastLba = loadBe32 (gHost.virt + kDataOffset);
+    capacity->blockBytes = loadBe32 (gHost.virt + kDataOffset + 4);
+  }
+  IOLockUnlock (gHost.lock);
+  return status;
+}
+
 // Query read request (opcode 0x03 READ ATTRIBUTE / 0x05 READ FLAG). Returns the value field.
 static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
 {
