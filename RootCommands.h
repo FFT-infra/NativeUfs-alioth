@@ -308,7 +308,7 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
 static bool hostInWindow (uint64_t lba, uint32_t blocks)
 {
   if (gRootOpen) {
-    return gRootWritable && lba >= gRootFirst && lba - gRootFirst < gRootBlocks &&
+    return lba >= gRootFirst && lba - gRootFirst < gRootBlocks &&
            blocks <= gRootBlocks - (lba - gRootFirst);
   }
   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;

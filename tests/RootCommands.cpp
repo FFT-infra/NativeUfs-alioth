@@ -119,6 +119,20 @@ static void testWholeUserdataRouting()
   assert(ufs_test_root_sync()==0);
   ufs_test_root_close();
 }
+
+static void testWholeUserdataReadOnly()
+{
+  std::array<uint8_t,4096> out;
+  reset();
+  assert(ufs_test_root_open(0x100,4,false));
+  assert(ufs_test_root_read(0x100,1,out.data())==0);
+  assert(out[0]==0x7b);
+  auto oldWrites=writes, oldReleases=releases;
+  assert(ufs_test_root_write(0x100,1,out.data())==kIOReturnNotWritable);
+  assert(ufs_test_root_sync()==kIOReturnNotWritable);
+  assert(writes==oldWrites && releases==oldReleases);
+  ufs_test_root_close();
+}
 int main()
 {
   reset(); assert(ufs_test_nop()==0);
@@ -164,5 +178,6 @@ int main()
   reset(); assert(ufs_test_stop_queue() && ufs_test_start_queue());
   assert(registers[0x50/4]==0xcb5e9000 && registers[0x54/4]==8);
   testWholeUserdataRouting();
+  testWholeUserdataReadOnly();
   puts("PASS: actual command/queue path and whole-userdata root window; malformed DMA responses, bounds, short reads, sense, quarantine, queue refusal and full-width DMA");
 }
