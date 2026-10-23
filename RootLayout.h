@@ -24,6 +24,7 @@ struct RootLayout {
   uint32_t ext4Magic;                     // 16 bits at byte 1080 of the partition (0xef53 on Linux ext4)
   uint32_t ext4Blocks;                    // s_blocks_count_lo at byte 1028
   uint32_t f2fsMagic;                     // 32 bits at byte 1024 of the partition (0xF2F52010 on Android F2FS)
+  uint32_t hfsMagic;                      // big-endian 16 bits at byte 1024 (0x482b HFS+, 0x4858 HFSX)
 };
 
 static uint8_t gScratch[kDataMax];
@@ -189,6 +190,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   layout->ext4Magic = uint32_t (gScratch[1080]) | (uint32_t (gScratch[1081]) << 8);
   layout->ext4Blocks = le32 (gScratch + 1028);
   layout->f2fsMagic = le32 (gScratch + 1024);
+  layout->hfsMagic = (uint32_t (gScratch[1024]) << 8) | gScratch[1025];
   layout->manifestStatus = 1;
   if (layout->magic0 == 0x474e4853U && layout->magic1 == 0x544f4f52U) {        // "SHNGROOT"
     uint32_t version = le32 (gScratch + 8), n = le32 (gScratch + 12);

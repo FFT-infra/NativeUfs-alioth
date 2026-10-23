@@ -79,8 +79,19 @@ int main(int argc,char **argv) {
     fixture();RootLayout layout;const char *why=nullptr;
     assert(findRootLayout(&layout,&why));
     assert(layout.lbaBytes==4096);
+    assert(layout.hfsMagic!=0x482b && layout.hfsMagic!=0x4858);
     assert(layout.typeGuid[0]==1 && layout.typeGuid[14]==15 && layout.typeGuid[15]==0);
     assert(layout.uniqueGuid[0]==0xa0 && layout.uniqueGuid[15]==0xaf);
+  }
+  {
+    fixture();manifest[1024]=0x48;manifest[1025]=0x2b;checksums();
+    RootLayout layout;const char *why=nullptr;
+    assert(findRootLayout(&layout,&why) && layout.hfsMagic==0x482b);
+  }
+  {
+    fixture();manifest[1024]=0x48;manifest[1025]=0x58;checksums();
+    RootLayout layout;const char *why=nullptr;
+    assert(findRootLayout(&layout,&why) && layout.hfsMagic==0x4858);
   }
   expect([]{header[16]^=1;},false,0,false);
   expect([]{entries[16]^=1;},false,0,false);

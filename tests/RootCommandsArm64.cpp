@@ -14,7 +14,8 @@ extern "C" void *memcpy(void *out, const void *in, size_t n) {
 using IOReturn=uint32_t;
 constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
   kIOReturnBadArgument=0xe00002c2, kIOReturnIOError=0xe00002ca,
-  kIOReturnBusy=0xe00002d5, kIOReturnTimeout=0xe00002d6, kIOReturnNotReady=0xe00002d8;
+  kIOReturnBusy=0xe00002d5, kIOReturnTimeout=0xe00002d6,
+  kIOReturnNotWritable=0xe00002cf, kIOReturnNotReady=0xe00002d8;
 constexpr unsigned kMicrosecondScale=1, kMillisecondScale=1000;
 struct Host { uint8_t *virt; uint64_t phys; bool ready,poisoned; uintptr_t hc; void *lock; };
 static Host gHost;
