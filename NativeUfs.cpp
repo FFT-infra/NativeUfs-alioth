@@ -1697,6 +1697,83 @@ OSDefineMetaClassAndStructors (NativeUfsWholeUserdataBlock, IOBlockStorageDevice
 // controller personality. The route is deliberately exclusive: it is never
 // created alongside the SHNGROOT store/log windows.
 static NativeUfsWholeUserdataBlock *gWholeUserdataDevice = nullptr;
+static bool gWholeUserdataRenameDone;
+
+static bool ufsHasAncestor (IORegistryEntry *entry, const IORegistryEntry *ancestor)
+{
+  IORegistryIterator *parents = IORegistryIterator::iterateOver (
+    entry, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
+  if (!parents) return false;
+  const bool found = ufsMediaHasAncestor (*parents, ancestor);
+  parents->release ();
+  return found;
+}
+
+// IOBlockStorageDriver publishes a normal IOMedia and IOMediaBSDClient assigns
+// diskX after that. Override the final BSD name only after this media is
+// reachable from our exact whole-userdata block device.
+static void renameWholeUserdataThread (void *, wait_result_t)
+{
+  NativeUfsWholeUserdataBlock *device = gWholeUserdataDevice;
+  if (!device) return;
+  device->retain ();
+
+  bool observedAssignedName = false;
+  for (unsigned tick = 0; tick < 300; ++tick) {
+    bool renamedThisTick = false;
+    OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+    OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
+    if (iterator) {
+      while (IOMedia *media = OSDynamicCast (IOMedia, iterator->getNextObject ())) {
+        if (!media->isWhole () || !ufsHasAncestor (media, device)) continue;
+        OSString *oldName = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
+        if (!oldName || !oldName->getLength ()) continue;
+        observedAssignedName = true;
+        if (!strcmp (oldName->getCStringNoCopy (), "ufsroot0")) {
+          continue;
+        }
+        OSString *newName = OSString::withCString ("ufsroot0");
+        if (!newName) continue;
+        media->setProperty (kIOBSDNameKey, newName);
+        newName->release ();
+        IOLog ("NativeUfs: whole-userdata IOMedia BSD name %s -> ufsroot0 entry=%llu\n",
+               oldName->getCStringNoCopy (), media->getRegistryEntryID ());
+        renamedThisTick = true;
+      }
+      iterator->release ();
+    }
+    OSSafeReleaseNULL (matching);
+    if (observedAssignedName) {
+      // Verify on a later tick so a racing IOMediaBSDClient assignment can be
+      // detected and corrected before root selection.
+      if (OSDictionary *verifyMatch = IOService::serviceMatching ("IOMedia")) {
+        OSIterator *verify = IOService::getMatchingServices (verifyMatch);
+        bool assigned = false;
+        if (verify) {
+          while (IOMedia *media = OSDynamicCast (IOMedia, verify->getNextObject ())) {
+            if (!media->isWhole () || !ufsHasAncestor (media, device)) continue;
+            OSString *name = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
+            if (name && name->getLength () && !strcmp (name->getCStringNoCopy (), "ufsroot0")) {
+              assigned = true;
+              break;
+            }
+          }
+          verify->release ();
+        }
+        OSSafeReleaseNULL (verifyMatch);
+        if (assigned && !renamedThisTick) {
+          __atomic_store_n (&gWholeUserdataRenameDone, true, __ATOMIC_RELEASE);
+          break;
+        }
+      }
+    }
+    IOSleep (100);
+  }
+  if (!__atomic_load_n (&gWholeUserdataRenameDone, __ATOMIC_ACQUIRE)) {
+    IOLog ("NativeUfs: whole-userdata BSD rename timed out\n");
+  }
+  device->release ();
+}
 
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
@@ -1783,6 +1860,19 @@ static void rootDiagnosticFailure (const char *reason)
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
   panic ("%s", gRootDiagnosticText);
+}
+
+static IOReturn rootPublishResult (UfsRootPhase phase)
+{
+  switch (phase) {
+  case UfsRootPhase::Identity: return kIOReturnNotPrivileged;
+  case UfsRootPhase::Schedule: return kIOReturnNoResources;
+  case UfsRootPhase::Prepare: return kIOReturnError;
+  case UfsRootPhase::Start: return kIOReturnIOError;
+  case UfsRootPhase::Media: return kIOReturnTimeout;
+  case UfsRootPhase::Complete: return kIOReturnSuccess;
+  }
+  return kIOReturnError;
 }
 
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
@@ -2134,6 +2224,13 @@ bool NativeUfs::startWholeUserdataRoot (IOService *provider)
   }
 
   gWholeUserdataDevice = device;
+  gWholeUserdataRenameDone = false;
+  thread_t renameThread = nullptr;
+  if (kernel_thread_start (renameWholeUserdataThread, nullptr, &renameThread) != KERN_SUCCESS) {
+    IOLog ("NativeUfs: whole-userdata BSD rename thread creation failed\n");
+  } else {
+    thread_deallocate (renameThread);
+  }
   native_ufs_root_step = 3;
   IOLog ("NativeUfs: whole-userdata root published first=%llx last=%llx blocks=%llu logical=%llu writable=%u\n",
          geometry.first_media_lba, geometry.last_media_lba, geometry.media_block_count,
@@ -2187,16 +2284,22 @@ static void captureMissingMedia (const char *uuid)
   OSDictionary *matching = IOService::serviceMatching ("IOMedia");
   OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
   unsigned count = 0;
-  while (iterator && used < int (sizeof (gRootMediaText)) - 180 && count++ < 8) {
+  while (iterator && used >= 0 && static_cast<size_t> (used) < sizeof (gRootMediaText) - 180 &&
+         count++ < 8) {
     IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
     if (!media) break;
     OSString *id = OSDynamicCast (OSString, media->getProperty ("UUID"));
     OSString *bsd = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
     OSNumber *size = OSDynamicCast (OSNumber, media->getProperty ("Size"));
-    used += snprintf (gRootMediaText + used, sizeof (gRootMediaText) - used,
-                      "media %.24s bytes=%llx uuid=%.36s\n",
-                      bsd ? bsd->getCStringNoCopy () : "-", size ? size->unsigned64BitValue () : 0ULL,
-                      id ? id->getCStringNoCopy () : "-");
+    const int written = snprintf (gRootMediaText + used, sizeof (gRootMediaText) - static_cast<size_t> (used),
+                                  "media %.24s bytes=%llx uuid=%.36s\n",
+                                  bsd ? bsd->getCStringNoCopy () : "-",
+                                  size ? size->unsigned64BitValue () : 0ULL,
+                                  id ? id->getCStringNoCopy () : "-");
+    if (written < 0 || static_cast<size_t> (written) >= sizeof (gRootMediaText) - static_cast<size_t> (used)) {
+      break;
+    }
+    used += written;
   }
   OSSafeReleaseNULL (iterator);
   OSSafeReleaseNULL (matching);
@@ -2248,7 +2351,7 @@ static void publishThread (void *, wait_result_t)
   } operations;
   UfsRootPublicationResult result = ufsPublishRootWindows (operations, gPublicationPlan);
   if (result.phase != UfsRootPhase::Complete) {
-    gRootDiagnostic.result = result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout;
+    gRootDiagnostic.result = static_cast<uint32_t> (rootPublishResult (result.phase));
     const char *reason = result.phase == UfsRootPhase::Start ? "root window service start failed" :
       (!strcmp (gPendingDevice[result.index]->windowLabel (), "SystemOS") ?
        "SystemOS signed volume not found" : "signed root window volume not found");
@@ -2316,7 +2419,7 @@ static void mediaReportThread (void *, wait_result_t)
                        native_ufs_blocks_published, native_ufs_block_reads, native_ufs_block_failures, count);
   OSDictionary *matching = IOService::serviceMatching ("IOMedia");
   OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
-  while (iterator && used < int (sizeof (gMediaReport)) - 200) {
+  while (iterator && used >= 0 && static_cast<size_t> (used) < sizeof (gMediaReport) - 200) {
     IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
     if (!media) {
       break;
@@ -2325,9 +2428,16 @@ static void mediaReportThread (void *, wait_result_t)
     OSString *bsd = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
     OSString *content = OSDynamicCast (OSString, media->getProperty ("Content"));
     OSNumber *size = OSDynamicCast (OSNumber, media->getProperty ("Size"));
-    used += snprintf (gMediaReport + used, sizeof (gMediaReport) - used, "%s %s size=%llx uuid=%s\n",
-                      bsd ? bsd->getCStringNoCopy () : "-", content ? content->getCStringNoCopy () : "-",
-                      size ? size->unsigned64BitValue () : 0ULL, uuid ? uuid->getCStringNoCopy () : "-");
+    const int written = snprintf (gMediaReport + used, sizeof (gMediaReport) - static_cast<size_t> (used),
+                                  "%s %s size=%llx uuid=%s\n",
+                                  bsd ? bsd->getCStringNoCopy () : "-",
+                                  content ? content->getCStringNoCopy () : "-",
+                                  size ? size->unsigned64BitValue () : 0ULL,
+                                  uuid ? uuid->getCStringNoCopy () : "-");
+    if (written < 0 || static_cast<size_t> (written) >= sizeof (gMediaReport) - static_cast<size_t> (used)) {
+      break;
+    }
+    used += written;
   }
   if (iterator) {
     iterator->release ();
@@ -2666,8 +2776,7 @@ bool NativeUfs::startRoot (IOService *provider)
   IOFree (layout, sizeof (RootLayout));
   if (result.phase != UfsRootPhase::Complete) {
     gPending = 0;
-    gRootDiagnostic.result = result.phase == UfsRootPhase::Identity ? kIOReturnNotPrivileged :
-      result.phase == UfsRootPhase::Schedule ? kIOReturnNoResources : kIOReturnError;
+    gRootDiagnostic.result = static_cast<uint32_t> (rootPublishResult (result.phase));
     IOLog ("NativeUfs: root preparation failed phase=%u window=%u; nothing published\n",
            static_cast<unsigned> (result.phase), result.index);
     IOService::stop (provider);
