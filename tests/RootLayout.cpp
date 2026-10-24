@@ -35,11 +35,16 @@ static void checksums() {
 static void fixture() {
   memset(header,0,sizeof(header)); memset(entries,0,sizeof(entries)); memset(manifest,0,sizeof(manifest));
   reads=0; failRead=false; userdata=8;
+  put32(manifest+1024,0xf2f52010);
   memcpy(header,"EFI PART",8); put32(header+8,0x10000);put32(header+12,92);
   put64(header+24,1);put64(header+32,511);put64(header+40,6);put64(header+48,506);
   put64(header+72,2);put32(header+80,32);put32(header+84,128);
   entries[0]=1; entries[16]=2;put64(entries+32,8);put64(entries+40,506);
   for(unsigned i=0;i<8;++i)entries[56+2*i]="userdata"[i];
+  entries[15]=0;
+  for(unsigned i=0;i<15;++i)entries[i]=uint8_t(i+1);
+  entries[16]=0;
+  for(unsigned i=0;i<16;++i)entries[16+i]=uint8_t(0xa0+i);
   memcpy(manifest,"SHNGROOT",8);put32(manifest+8,1);put32(manifest+12,2);put64(manifest+16,65536);
   for(unsigned i=0;i<2;++i) {
     uint8_t *e=manifest+24+i*128;strcpy(reinterpret_cast<char *>(e),i?"SystemOS":"OS");
@@ -51,11 +56,32 @@ static void expect(const std::function<void()> &change,bool gpt,uint32_t status,
   fixture();change();if(rehash)checksums();RootLayout layout;const char *why=nullptr;
   bool result=findRootLayout(&layout,&why);
   assert(result==gpt);if(gpt)assert(layout.manifestStatus==status);
+  if(result && !status)assert(layout.f2fsMagic==0xf2f52010);
   if(!result || status)assert(layout.windows==0);
 }
 int main(int argc,char **argv) {
   assert(rootCrc32(reinterpret_cast<const uint8_t *>("123456789"),9)==0xcbf43926);
+  {
+    uint8_t block[4096];
+    for(unsigned i=0;i<sizeof(block);++i)block[i]=uint8_t(i);
+    char text[2048];int used=rootHexWindow(text,sizeof(text),block,sizeof(block),0,32,0);
+    assert(used>0 && strstr(text,"+00000000: 00 01 02 03") && strstr(text,"+00000010: 10 11 12 13"));
+    used=rootHexWindow(text,sizeof(text),block,sizeof(block),0x3f0,80,0);
+    assert(used>0 && strstr(text,"+000003f0: f0 f1 f2 f3") && strstr(text,"+00000400: 00 01 02 03") &&
+           strstr(text,"+00000430: 30 31 32 33"));
+    used=rootHexWindow(text,sizeof(text),block,sizeof(block),0x3f0,80,0x1000);
+    assert(used>0 && strstr(text,"+000013f0: f0 f1 f2 f3") && strstr(text,"+00001400: 00 01 02 03"));
+    assert(rootHexWindow(text,sizeof(text),block,sizeof(block),4095,2,0)==0);
+    assert(rootHexWindow(text,8,block,sizeof(block),0,16,0)==0);
+  }
   expect([]{},true,0);
+  {
+    fixture();RootLayout layout;const char *why=nullptr;
+    assert(findRootLayout(&layout,&why));
+    assert(layout.lbaBytes==4096);
+    assert(layout.typeGuid[0]==1 && layout.typeGuid[14]==15 && layout.typeGuid[15]==0);
+    assert(layout.uniqueGuid[0]==0xa0 && layout.uniqueGuid[15]==0xaf);
+  }
   expect([]{header[16]^=1;},false,0,false);
   expect([]{entries[16]^=1;},false,0,false);
   expect([]{put32(header+12,4097);},false,0);
@@ -67,7 +93,7 @@ int main(int argc,char **argv) {
   expect([]{put64(header+48,511);},false,0);
   expect([]{put64(entries+32,1);},false,0);
   expect([]{put64(entries+40,UINT64_MAX);},false,0);
-  expect([]{entries[0]=0;},false,0);
+  expect([]{memset(entries,0,16);},false,0);
   expect([]{memcpy(entries+128,entries,128);},false,0);
   expect([]{memcpy(entries+128,entries,128);put64(entries+40,100);put64(entries+128+32,101);},false,0);
   expect([]{failRead=true;},false,0);

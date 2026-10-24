@@ -3,7 +3,9 @@
 // native-ufs-probe=1 is present. This is a register probe, not a storage driver.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#endif
 #include <libkern/crypto/sha2.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
@@ -38,6 +40,47 @@ static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
 static void rootDiagnosticFailure (const char *reason);
 
+struct UfsProbeStreamSnapshot {
+  uint16_t sid;
+  uint32_t smr, s2cr;
+};
+
+struct UfsProbeSnapshot {
+  uint32_t cap, hcs, hce, utrlba, utrlbau, doorbell, rsr;
+  UfsProbeStreamSnapshot stream[2];
+  uint32_t gfsr;
+};
+
+static UfsProbeSnapshot probeSnapshot (uintptr_t hc, uintptr_t smmu,
+                                       uint16_t primary, uint16_t secondary);
+
+struct UfsStreamConfig {
+  uint16_t primary;
+  uint16_t secondary;
+};
+
+// The sheng board routes the UFS host through SMMU stream 0x60. Keep that
+// default, and let a board with the generic qcom,ufshc binding select one or
+// two streams. SM8250 UFS uses both 0x0e0 and 0x4e0.
+static UfsStreamConfig ufsStreams (void)
+{
+  UfsStreamConfig config = { 0x60, 0 };
+  uint32_t stream = 0, stream2 = 0;
+  if (PE_parse_boot_argn ("native-ufs-stream", &stream, sizeof (stream)) && stream && stream <= 0xffff) {
+    config.primary = static_cast<uint16_t> (stream);
+  }
+  if (PE_parse_boot_argn ("native-ufs-stream2", &stream2, sizeof (stream2)) &&
+      stream2 && stream2 <= 0xffff && stream2 != config.primary) {
+    config.secondary = static_cast<uint16_t> (stream2);
+  }
+  return config;
+}
+
+static uint16_t ufsStream (void)
+{
+  return ufsStreams ().primary;
+}
+
 extern "C" {
 // Optional passive observer; absent in ordinary builds. It may run while a
 // window lock is held, so its contract forbids blocking or transport access.
@@ -68,7 +111,9 @@ class NativeUfs : public IOService {
   void dumpFirmwareList (void);
   void inspectSmmu (void);
   void inspectContextBanks (void);
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
   bool startRoot (IOService *provider);
+#endif
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
 public:
   IOService *probe (IOService *provider, SInt32 *score) override;
@@ -81,6 +126,40 @@ OSDefineMetaClassAndStructors (NativeUfs, IOService)
 static uint32_t read32 (uintptr_t base, unsigned offset)
 {
   return *reinterpret_cast<volatile uint32_t *> (base + offset);
+}
+
+static UfsProbeSnapshot probeSnapshot (uintptr_t hc, uintptr_t smmu,
+                                       uint16_t primary, uint16_t secondary)
+{
+  UfsProbeSnapshot snapshot = {};
+  const uint16_t configured[2] = { primary, secondary };
+  snapshot.cap = read32 (hc, 0x00);
+  snapshot.hcs = read32 (hc, 0x30);
+  snapshot.hce = read32 (hc, 0x34);
+  snapshot.utrlba = read32 (hc, 0x50);
+  snapshot.utrlbau = read32 (hc, 0x54);
+  snapshot.doorbell = read32 (hc, 0x58);
+  snapshot.rsr = read32 (hc, 0x60);
+  snapshot.gfsr = read32 (smmu, 0x48);
+  unsigned count = read32 (smmu, 0x20) & 0xff;
+  if (count > 128) {
+    count = 128;
+  }
+  for (unsigned stream = 0; stream < 2; ++stream) {
+    snapshot.stream[stream].sid = configured[stream];
+    if (!configured[stream]) {
+      continue;
+    }
+    for (unsigned index = 0; index < count; ++index) {
+      uint32_t smr = read32 (smmu, 0x800 + 4 * index);
+      if (ufsSmmuStreamMatches (smr, configured[stream])) {
+        snapshot.stream[stream].smr = smr;
+        snapshot.stream[stream].s2cr = read32 (smmu, 0xc00 + 4 * index);
+        break;
+      }
+    }
+  }
+  return snapshot;
 }
 
 static void write32 (uintptr_t base, unsigned offset, uint32_t value)
@@ -125,10 +204,12 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   bool match = false;
   if (data) {
     const char *text = static_cast<const char *> (data->getBytesNoCopy ());
-    match = text && contains (text, data->getLength (), "qcom,sm8550-ufshc");
+    match = text && (contains (text, data->getLength (), "qcom,sm8550-ufshc") ||
+                     contains (text, data->getLength (), "qcom,ufshc"));
   } else if (string) {
     const char *text = string->getCStringNoCopy ();
-    match = text && contains (text, string->getLength (), "qcom,sm8550-ufshc");
+    match = text && (contains (text, string->getLength (), "qcom,sm8550-ufshc") ||
+                     contains (text, string->getLength (), "qcom,ufshc"));
   }
   if (!match) {
     return nullptr;
@@ -164,6 +245,29 @@ static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMa
   keep = OSSharedPtr<IOMemoryMap> (memory->map (kIOMapAnywhere | kIOMapInhibitCache), OSNoRetain);
   memory->release ();
   return keep ? static_cast<uintptr_t> (keep->getVirtualAddress ()) : 0;
+}
+
+static void requireDualStreamReuse (unsigned probe, unsigned rootMode, const char *where)
+{
+  UfsStreamConfig streams = ufsStreams ();
+  if (!streams.secondary) return;
+  OSSharedPtr<IOMemoryMap> map;
+  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, map);
+  if (!smmu) panic ("NATIVE_UFS dual stream: SMMU map failed");
+  uint16_t configured[2] = { streams.primary, streams.secondary };
+  for (unsigned index = 0; index < 2; ++index) {
+    UfsSmmuReuse reuse = reuseUfsSmmuStream (configured[index],
+      [smmu](unsigned offset) { return read32 (smmu, offset); });
+    if (reuse.error) {
+      panic ("NATIVE_UFS dual stream reuse refused: %s sid=%04x slot=%x bank=%x refs=%u smr=%08x s2cr=%08x cbar=%08x cba2r=%08x sctlr=%08x where=%s probe=%u root=%u",
+             reuse.error, configured[index], reuse.slot, reuse.bank, reuse.references,
+             reuse.smr, reuse.s2cr, reuse.cbar, reuse.cba2r, reuse.sctlr,
+             where, probe, rootMode);
+    }
+    IOLog ("NativeUfs: dual stream reuse sid=%04x slot=%x bank=%x refs=%u smr=%08x s2cr=%08x cbar=%08x cba2r=%08x sctlr=%08x\n",
+           configured[index], reuse.slot, reuse.bank, reuse.references,
+           reuse.smr, reuse.s2cr, reuse.cbar, reuse.cba2r, reuse.sctlr);
+  }
 }
 
 void NativeUfs::inspect (void)
@@ -227,7 +331,8 @@ struct UfsResult {
 
 static void be32 (uint8_t *at, uint32_t value)
 {
-  at[0] = value >> 24; at[1] = value >> 16; at[2] = value >> 8; at[3] = value;
+  at[0] = uint8_t (value >> 24); at[1] = uint8_t (value >> 16);
+  at[2] = uint8_t (value >> 8); at[3] = uint8_t (value);
 }
 
 static uint32_t getBe32 (const uint8_t *at)
@@ -285,6 +390,14 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
+  UfsSmmuReuse reuse = reuseUfsSmmuStream (stream,
+    [smmu](unsigned offset) { return read32 (smmu, offset); });
+  if (!reuse.error) {
+    report[0] = reuse.slot | (reuse.bank << 16);
+    report[1] = reuse.cbar;
+    report[2] = reuse.sctlr;
+    return;
+  }
   UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, [smmu](unsigned offset) { return read32 (smmu, offset); });
   gRootDiagnostic.smmuId1 = read32 (smmu, 0x24);
   gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
@@ -298,12 +411,15 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   }
   unsigned bank = plan.bank, index = plan.slot;
   uintptr_t cb = smmu + (plan.pages + bank) * 4096;
+  UfsSmmuSnapshot before = captureUfsSmmuSnapshot (plan,
+    [smmu](unsigned offset) { return read32 (smmu, offset); });
+  UfsSmmuConfigDiagnostic diagnostic;
   const char *failure = configureUfsSmmu (plan, stream,
     [smmu](unsigned offset) { return read32 (smmu, offset); },
     [smmu](unsigned offset, uint32_t value) {
       write32 (smmu, offset, value);
       __asm__ volatile ("dsb sy" ::: "memory");
-    });
+    }, &diagnostic);
   uint32_t smr = read32 (smmu, 0x800 + 4 * index), s2cr = read32 (smmu, 0xc00 + 4 * index);
   uint32_t cbar = read32 (smmu, 0x1000 + 4 * bank), sctlr = read32 (cb, 0x0);
   gRootDiagnostic.smr = smr; gRootDiagnostic.s2cr = s2cr;
@@ -311,11 +427,20 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
   gRootDiagnostic.cba2r = read32 (smmu, 0x1800 + 4 * bank);
   if (failure) {
+    UfsSmmuSnapshot after = captureUfsSmmuSnapshot (plan,
+      [smmu](unsigned offset) { return read32 (smmu, offset); });
     gRootDiagnostic.stage = "SMMU readback";
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     rootDiagnosticFailure (failure);
-    panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
-           gRootDiagnostic.cba2r);
+    panic ("NATIVE_UFS smmu: %s idx=%u bank=%u step=%s off=%x exp=%x act=%x\n"
+           "before scr0=%08x gfsr=%08x smr=%08x s2cr=%08x cbar=%08x cba2r=%08x sctlr=%08x\n"
+           "after  scr0=%08x gfsr=%08x smr=%08x s2cr=%08x cbar=%08x cba2r=%08x sctlr=%08x",
+           failure, index, bank, diagnostic.step ? diagnostic.step : "(none)",
+           diagnostic.offset, diagnostic.expected, diagnostic.actual,
+           before.scr0, before.gfsr, before.smr, before.s2cr,
+           before.cbar, before.cba2r, before.sctlr,
+           after.scr0, after.gfsr, after.smr, after.s2cr,
+           after.cbar, after.cba2r, after.sctlr);
   }
   report[0] = index | (bank << 16);
   report[1] = cbar;
@@ -367,7 +492,7 @@ void NativeUfs::adoptAndRead (unsigned level)
   unsigned stopLoops = 10000;
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
   if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
-  smmuBypassStream (0x60, smmuMap, smmuReport, phys, 16384);
+  smmuBypassStream (ufsStream (), smmuMap, smmuReport, phys, 16384);
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
@@ -605,11 +730,11 @@ void NativeUfs::adoptAndRead (unsigned level)
         if (!name[c]) { name[c] = 0; break; }
       }
       name[13] = 0;
-      used += snprintf (text + used, sizeof (text) - used, "%u:%s %llx-%llx%s", index, name,
+      used += snprintf (text + used, sizeof (text) - static_cast<size_t> (used), "%u:%s %llx-%llx%s", index, name,
                         le64 (entry + 32), le64 (entry + 40), (++column % 3) ? "  " : "\n");
       listed++;
     }
-    snprintf (text + used, sizeof (text) - used, "\nlisted=%u", listed);
+    snprintf (text + used, sizeof (text) - static_cast<size_t> (used), "\nlisted=%u", listed);
     panic ("%s", text);
   }
   // INQUIRY of LUN 0: vendor/product bytes 8..23.
@@ -710,44 +835,107 @@ void NativeUfs::dumpFirmwareList (void)
          ucdPhys, ucd0, ucd1, ucd2, ucd3);
 }
 
-// Read-only dump of the apps SMMU (apps_smmu@15000000) global register space and the stream
-// match entry for the UFS stream ID 0x60 (native-ufs-probe=7). SMMUv2 layout: sCR0 0x0,
-// IDR0 0x20, sGFSR 0x48, SMR(n) 0x800+4n, S2CR(n) 0xc00+4n. Nothing is written.
+// Read-only dump of the apps SMMU (apps_smmu@15000000) global register space,
+// both configured UFS streams and their context-bank state (native-ufs-probe=7).
+// SMMUv2 layout: sCR0 0x0, IDR0 0x20, sGFSR 0x48, SMR(n) 0x800+4n,
+// S2CR(n) 0xc00+4n, CBAR 0x1000+4n, CBA2R 0x1800+4n. Nothing is written.
 void NativeUfs::inspectSmmu (void)
 {
   OSSharedPtr<IOMemoryMap> map;
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0x1000, map);
+  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, map);
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
   uint32_t scr0 = read32 (smmu, 0x00), idr0 = read32 (smmu, 0x20), idr1 = read32 (smmu, 0x24);
-  uint32_t gfsr = read32 (smmu, 0x48);
+  uint32_t idr2 = read32 (smmu, 0x28), gfsr = read32 (smmu, 0x48);
   unsigned count = idr0 & 0xff;
   if (count > 128) {
     count = 128;
   }
-  unsigned match = 0xffff, valid = 0, typeCount[4] = { 0, 0, 0, 0 };
-  uint32_t matchSmr = 0, matchS2cr = 0;
-  for (unsigned index = 0; index < count; index++) {
-    uint32_t smr = read32 (smmu, 0x800 + 4 * index);
-    uint32_t s2cr = read32 (smmu, 0xc00 + 4 * index);
-    if (smr & 0x80000000U) {
-      valid++;
-      typeCount[(s2cr >> 16) & 3]++;
-      uint32_t mask = (smr >> 16) & 0x7fff;
-      if (match == 0xffff && (((smr ^ 0x60U) & 0x7fffU) & ~mask) == 0) {
-        match = index;
-        matchSmr = smr;
-        matchS2cr = s2cr;
+  unsigned numCb = idr1 & 0xff;
+  unsigned globalPages = 1U << (((idr1 >> 28) & 7) + 1);
+  bool contextMapped = globalPages <= 128 && numCb <= 128 &&
+                       (globalPages + numCb) * 0x1000 <= 0xd0000;
+  UfsSmmuStreamEntry entries[128] = {};
+  unsigned valid = collectUfsSmmuStreams ([smmu](unsigned offset) { return read32 (smmu, offset); },
+                                          entries, 128);
+  unsigned typeCount[4] = { 0, 0, 0, 0 };
+  for (unsigned entry = 0; entry < valid; entry++) {
+    typeCount[(entries[entry].s2cr >> 16) & 3]++;
+  }
+
+  UfsStreamConfig streams = ufsStreams ();
+  uint16_t configured[2] = { streams.primary, streams.secondary };
+  char streamText[1400] = {};
+  unsigned streamUsed = 0, configuredCount = streams.secondary ? 2 : 1;
+  for (unsigned index = 0; index < configuredCount; index++) {
+    uint16_t stream = configured[index];
+    const UfsSmmuStreamEntry *match = nullptr;
+    unsigned matches = 0;
+    for (unsigned entry = 0; entry < valid; entry++) {
+      if (ufsSmmuStreamMatches (entries[entry].smr, stream)) {
+        ++matches;
+        if (!match) {
+          match = &entries[entry];
+        }
       }
     }
+    unsigned cb = match ? (match->s2cr & 0xff) : 0xffff;
+    unsigned type = match ? ((match->s2cr >> 16) & 3) : 0;
+    unsigned references = 0;
+    for (unsigned entry = 0; entry < valid; entry++) {
+      if (((entries[entry].s2cr >> 16) & 3) == 0 && (entries[entry].s2cr & 0xff) == cb) {
+        ++references;
+      }
+    }
+    uint32_t cbar = 0, cba2r = 0, sctlr = 0;
+    if (match && contextMapped && cb < numCb) {
+      cbar = read32 (smmu, 0x1000 + 4 * cb);
+      cba2r = read32 (smmu, 0x1800 + 4 * cb);
+      sctlr = read32 (smmu + (globalPages + cb) * 0x1000, 0);
+    }
+    unsigned mask = match ? ((match->smr >> 16) & 0x7fff) : 0;
+    unsigned safe = matches == 1 && match && mask == 0 && type == 0 &&
+                    cb < numCb && references == 1 &&
+                    ufsSmmuContextIsBypass (cbar, sctlr) && (cba2r & 1);
+    int written = snprintf (streamText + streamUsed, sizeof (streamText) - streamUsed,
+                            "%ssid%04x matches=%u idx=%x mask=%04x smr=%08x s2cr=%08x type=%u cb=%x refs=%u cbar=%08x cba2r=%08x sctlr=%08x safe=%u",
+                            index ? "\n" : "", stream, matches,
+                            match ? match->index : 0xffff, mask,
+                            match ? match->smr : 0, match ? match->s2cr : 0,
+                            type, cb, references, cbar, cba2r, sctlr, safe);
+    if (written < 0 || static_cast<unsigned> (written) >= sizeof (streamText) - streamUsed) {
+      break;
+    }
+    streamUsed += static_cast<unsigned> (written);
+  }
+
+  char details[1536] = {};
+  unsigned used = 0, listed = 0;
+  for (unsigned entry = 0; entry < valid; entry++) {
+    int written = snprintf (details + used, sizeof (details) - used,
+                            "%s[%u] sid=%04x mask=%04x smr=%08x s2cr=%08x",
+                            entry ? "\n" : "", entries[entry].index,
+                            entries[entry].smr & 0xffffU, (entries[entry].smr >> 16) & 0x7fffU,
+                            entries[entry].smr, entries[entry].s2cr);
+    if (written < 0 || static_cast<unsigned> (written) >= sizeof (details) - used) {
+      break;
+    }
+    used += static_cast<unsigned> (written);
+    listed++;
+  }
+  if (!listed) {
+    snprintf (details, sizeof (details), "(none)");
+  } else if (listed < valid) {
+    snprintf (details + used, sizeof (details) - used, "\n... %u more", valid - listed);
   }
   panic ("NATIVE_UFS smmu\n"
-         "scr0=%08x idr0=%08x idr1=%08x gfsr=%08x\n"
-         "nsmr=%u valid=%u types t0=%u t1=%u t2=%u\n"
-         "sid0x60 match=%x smr=%08x s2cr=%08x",
-         scr0, idr0, idr1, gfsr, count, valid, typeCount[0], typeCount[1], typeCount[2],
-         match, matchSmr, matchS2cr);
+         "scr0=%08x idr0=%08x idr1=%08x idr2=%08x gfsr=%08x\n"
+         "nsmr=%u valid=%u ncb=%u pages=%u context_mapped=%u types t0=%u t1=%u t2=%u\n"
+         "%s\n"
+         "enabled SMRs:\n%s",
+         scr0, idr0, idr1, idr2, gfsr, count, valid, numCb, globalPages, contextMapped,
+         typeCount[0], typeCount[1], typeCount[2], streamText, details);
 }
 
 // Read-only context-bank survey (native-ufs-probe=8): CBAR/CBA2R in gr1 and SCTLR/TTBR0 in the
@@ -883,6 +1071,9 @@ static void hostWrite (unsigned offset, uint32_t value)
 // `why` receives a short reason on failure.
 static bool hostBringUp (const char **why)
 {
+  // A secondary stream is a board-level transport dependency, not an optional
+  // diagnostic. Validate both existing mappings before any controller access.
+  requireDualStreamReuse (0, 0, "host bring-up");
   if (gHost.poisoned) {
     *why = "transport quarantined";
     return false;
@@ -927,7 +1118,7 @@ static bool hostBringUp (const char **why)
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (!hostStopQueue (why)) return false;
-  smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  smmuBypassStream (ufsStream (), gHost.smmuMap, report, gHost.phys, kDmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
   uint32_t idr1 = read32 (gHost.smmu, 0x24);
   gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
@@ -989,8 +1180,10 @@ static uint32_t be32w (const uint8_t *at)
 }
 
 #include "RootLayout.h"
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 #include "RootWindowRead.h"
 #include "RootPublication.h"
+#endif
 
 }
 
@@ -1203,6 +1396,7 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
 // the virtio path.
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
   uint64_t absolute = 0;      // byte offset of the window on LUN 0
@@ -1269,6 +1463,13 @@ extern "C" void native_ufs_progress_text (char *out, size_t size)
   sample.failures = native_ufs_block_failures;
   formatUfsRootDiagnostics (out, size, sample, "cached values; not a new HW fault sample", "UFS CACHED SNAPSHOT");
 }
+#else
+volatile uint32_t native_ufs_blocks_published = 0;
+volatile uint64_t native_ufs_block_reads = 0;
+volatile uint64_t native_ufs_block_failures = 0;
+static char gRootDiagnosticText[2500];
+static char gRootMediaText[1000];
+#endif
 
 static void rootDiagnosticFailure (const char *reason)
 {
@@ -1283,6 +1484,7 @@ static void rootDiagnosticFailure (const char *reason)
   panic ("%s", gRootDiagnosticText);
 }
 
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint64_t size)
 {
   if (!name || !ufsWindowGeometry (absoluteOffset, size)) {
@@ -1650,7 +1852,9 @@ static void publishThread (void *, wait_result_t)
   }
   gPendingProvider->release ();  // Balanced with successful thread dispatch.
 }
+#endif
 
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 // Memory snapshot (native-ufs-probe=13): root mode as usual, then, after a delay, the kernel's own
 // page counters on the panic screen. Observation only.
 extern "C" {
@@ -1726,13 +1930,24 @@ static void mediaReportThread (void *, wait_result_t)
   }
   panic ("%s", gMediaReport);
 }
+#endif
 
 bool NativeUfs::start (IOService *provider)
 {
   unsigned probe = 0, rootMode = 0;
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
+  UfsStreamConfig streams = ufsStreams ();
+  IOLog ("NativeUfs: start provider=%s probe=%u root=%u stream=%04x stream2=%04x\n",
+         provider && OSDynamicCast (IOPlatformExpertDevice, provider) ? "platform" : "device",
+         probe, rootMode, streams.primary, streams.secondary);
   native_ufs_probe_requested = probe != 0;
+  bool mutatesTransport = (probe >= 3 && probe <= 5) || probe == 9 || probe == 10 ||
+                          probe == 11 || probe == 12 || probe == 13 ||
+                          (rootMode && !probe);
+  if (streams.secondary && mutatesTransport) {
+    requireDualStreamReuse (probe, rootMode, "start");
+  }
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
   if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
@@ -1757,21 +1972,98 @@ bool NativeUfs::start (IOService *provider)
     adoptAndRead (probe);
   }
   if (probe == 10) {
-    // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
+    // Non-data-mutating check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
+    // Controller, SMMU and device state may still be touched while establishing the transport.
+    OSSharedPtr<IOMemoryMap> beforeHcMap, beforeSmmuMap;
+    uintptr_t beforeHc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, beforeHcMap);
+    uintptr_t beforeSmmu = mapPhys (0x15000000ULL, 0xd0000, beforeSmmuMap);
+    if (!beforeHc || !beforeSmmu) {
+      panic ("NATIVE_UFS root check: pre-probe map failed hc=%p smmu=%p", (void *) beforeHc, (void *) beforeSmmu);
+    }
+    UfsProbeSnapshot before = probeSnapshot (beforeHc, beforeSmmu, streams.primary, streams.secondary);
+    IOLog ("NativeUfs: probe10 before cap=%08x hcs=%08x hce=%08x utrlba=%08x utrlbau=%08x db=%08x rsr=%08x s0=%04x/%08x/%08x s1=%04x/%08x/%08x gfsr=%08x\n",
+           before.cap, before.hcs, before.hce, before.utrlba, before.utrlbau,
+           before.doorbell, before.rsr,
+           before.stream[0].sid, before.stream[0].smr, before.stream[0].s2cr,
+           before.stream[1].sid, before.stream[1].smr, before.stream[1].s2cr, before.gfsr);
     const char *why = "";
     if (!hostBringUp (&why)) {
       panic ("NATIVE_UFS root check: bring-up failed: %s", why);
     }
+    UfsReadCapacity capacity = {};
+    IOReturn capacityStatus = hostReadCapacity (0, &capacity);
+    UfsProbeSnapshot after = probeSnapshot (gHost.hc, gHost.smmu, streams.primary, streams.secondary);
+    IOLog ("NativeUfs: probe10 after cap=%08x hcs=%08x hce=%08x utrlba=%08x utrlbau=%08x db=%08x rsr=%08x s0=%04x/%08x/%08x s1=%04x/%08x/%08x gfsr=%08x\n",
+           after.cap, after.hcs, after.hce, after.utrlba, after.utrlbau,
+           after.doorbell, after.rsr,
+           after.stream[0].sid, after.stream[0].smr, after.stream[0].s2cr,
+           after.stream[1].sid, after.stream[1].smr, after.stream[1].s2cr, after.gfsr);
     RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
     if (!layout || !findRootLayout (layout, &why)) {
       panic ("NATIVE_UFS root check: %s", why);
     }
-    panic ("NATIVE_UFS root check\n"
-           "userdata first=%llx last=%llx\n"
-           "block0 magic %08x %08x ext4magic=%04x ext4blocks=%u\n"
-           "manifest status=%u windows=%u",
-           layout->userdataFirst, layout->userdataLast, layout->magic0, layout->magic1,
-           layout->ext4Magic, layout->ext4Blocks, layout->manifestStatus, layout->windows);
+    // Preserve the first block in gScratch and use the following scratch block
+    // for userdataFirst + 1. Both reads are SCSI READ(10); no write is issued.
+    uint8_t *repeat = gScratch + 4096;
+    uint8_t *second = gScratch + 8192;
+    IOReturn repeatStatus = hostRead4k (0, layout->userdataFirst, 1, repeat);
+    bool repeatMatch = repeatStatus == kIOReturnSuccess && memcmp (gScratch, repeat, 4096) == 0;
+    IOReturn secondStatus = hostRead4k (0, layout->userdataFirst + 1, 1, second);
+    UfsProbeSnapshot final = probeSnapshot (gHost.hc, gHost.smmu, streams.primary, streams.secondary);
+    static char evidence[4096];
+    unsigned used = 0;
+    auto append = [&] (int written) {
+      if (used >= sizeof (evidence)) {
+        used = sizeof (evidence) - 1;
+      } else if (written >= 0 && size_t (written) < sizeof (evidence) - used) {
+        used += unsigned (written);
+      } else {
+        used = sizeof (evidence) - 1;
+      }
+    };
+    append (snprintf (evidence, sizeof (evidence),
+                      "NATIVE_UFS raw probe\n"
+                      "capacity last=%u bytes=%u total=%llu scsi=%04x ocs=%02x status=%08x\n"
+                      "userdata first=%llx last=%llx gpt_lba_bytes=%u manifest=%u windows=%u\n"
+                      "magic %08x %08x ext4magic=%04x ext4blocks=%u f2fsmagic=%08x\n"
+                      "repeat status=%08x match=%u second=%08x\n",
+                      capacity.lastLba, capacity.blockBytes,
+                      (uint64_t (capacity.lastLba) + 1) * capacity.blockBytes,
+                      capacity.scsi, capacity.ocs, capacityStatus,
+                      layout->userdataFirst, layout->userdataLast, layout->lbaBytes,
+                      layout->manifestStatus, layout->windows,
+                      layout->magic0, layout->magic1, layout->ext4Magic,
+                      layout->ext4Blocks, layout->f2fsMagic,
+                      repeatStatus, repeatMatch ? 1U : 0U, secondStatus));
+    append (snprintf (evidence + used, sizeof (evidence) - used, "first 0000..007f\n"));
+    int hex = rootHexWindow (evidence + used, sizeof (evidence) - used,
+                             gScratch, 4096, 0, 0x80, 0);
+    append (hex);
+    append (snprintf (evidence + used, sizeof (evidence) - used, "first 03f0..043f\n"));
+    hex = rootHexWindow (evidence + used, sizeof (evidence) - used,
+                         gScratch, 4096, 0x3f0, 0x50, 0);
+    append (hex);
+    append (snprintf (evidence + used, sizeof (evidence) - used, "second 13f0..143f\n"));
+    hex = rootHexWindow (evidence + used, sizeof (evidence) - used,
+                         second, 4096, 0x3f0, 0x50, 0x1000);
+    append (hex);
+    append (snprintf (evidence + used, sizeof (evidence) - used,
+                      "before hcs=%08x db=%08x rsr=%08x gfsr=%08x\n"
+                      "before %04x=%08x/%08x %04x=%08x/%08x\n"
+                      "after  hcs=%08x db=%08x rsr=%08x gfsr=%08x\n"
+                      "after  %04x=%08x/%08x %04x=%08x/%08x\n"
+                      "final  hcs=%08x db=%08x rsr=%08x gfsr=%08x\n"
+                      "final  %04x=%08x/%08x %04x=%08x/%08x\n",
+                      before.hcs, before.doorbell, before.rsr, before.gfsr,
+                      before.stream[0].sid, before.stream[0].smr, before.stream[0].s2cr,
+                      before.stream[1].sid, before.stream[1].smr, before.stream[1].s2cr,
+                      after.hcs, after.doorbell, after.rsr, after.gfsr,
+                      after.stream[0].sid, after.stream[0].smr, after.stream[0].s2cr,
+                      after.stream[1].sid, after.stream[1].smr, after.stream[1].s2cr,
+                      final.hcs, final.doorbell, final.rsr, final.gfsr,
+                      final.stream[0].sid, final.stream[0].smr, final.stream[0].s2cr,
+                      final.stream[1].sid, final.stream[1].smr, final.stream[1].s2cr));
+    panic ("%s", evidence);
   }
   if (probe == 11) {
     // After the root image is flashed: manifest, then each window's own GPT (sector 1 of the
@@ -1806,6 +2098,7 @@ bool NativeUfs::start (IOService *provider)
            be32w (layout->window[0].sha256), be32w (layout->window[0].sha256 + 4), be32w (layout->window[0].sha256 + 8), be32w (layout->window[0].sha256 + 12),
            be32w (layout->window[1].sha256), be32w (layout->window[1].sha256 + 4), be32w (layout->window[1].sha256 + 8), be32w (layout->window[1].sha256 + 12));
   }
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
   if (probe == 14) {
     // Immediate memory snapshot at root-device start, before the userspace that triggers jetsam.
     panic ("NATIVE_UFS early memory snapshot\n"
@@ -1815,6 +2108,8 @@ bool NativeUfs::start (IOService *provider)
            vm_page_wire_count, vm_page_speculative_count, vm_page_purgeable_count,
            memorystatus_available_pages, max_mem, nprocs);
   }
+#endif
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
   if (probe == 13) {
     unsigned delay = 12;
     PE_parse_boot_argn ("native-ufs-stats-delay", &delay, sizeof (delay));
@@ -1843,9 +2138,11 @@ bool NativeUfs::start (IOService *provider)
   if (rootMode && !probe) {
     return startRoot (provider);
   }
+#endif
   return false;
 }
 
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 // Boot the root image's windows as block devices. Soft-fails (logs, publishes nothing).
 bool NativeUfs::startRoot (IOService *provider)
 {
@@ -1956,6 +2253,7 @@ bool NativeUfs::startRoot (IOService *provider)
   }
   return true;
 }
+#endif
 
 void NativeUfs::stop (IOService *provider)
 {

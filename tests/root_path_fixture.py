@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import uuid
 import zlib
 
@@ -24,8 +25,9 @@ def build_library(source, out, verified_root, openssl):
             '-I', str(verified_root / 'include'), '-I', str(openssl / 'include'),
             '-c', str(verified_root / name), '-o', str(target)], check=True)
         objects.append(str(target))
-    library = out / 'root-path.dylib'
-    subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-dynamiclib',
+    library = out / ('root-path.dylib' if sys.platform == 'darwin' else 'root-path.so')
+    link = ['-dynamiclib'] if sys.platform == 'darwin' else ['-shared']
+    subprocess.run(['clang++', '-std=c++17', '-fPIC', '-Wall', '-Wextra', '-Werror', *link,
         '-I', str(verified_root / 'include'), '-I', str(openssl / 'include'),
         str(source / 'RootPathBridge.cpp'), *objects, '-L', str(openssl / 'lib'), '-lcrypto',
         '-o', str(library)], check=True)

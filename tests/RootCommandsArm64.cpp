@@ -147,6 +147,11 @@ extern "C" void guest_main() {
     check(result==kIOReturnNotReady && (scsi==2 || scsi==0x102),"TUR check condition");
   }
   check(result==0,"TUR ready");
+  UfsReadCapacity capacity={};
+  check(hostReadCapacity(0,&capacity)==0 && capacity.lastLba==511 && capacity.blockBytes==4096 &&
+        capacity.scsi==0 && capacity.ocs==0,"READ CAPACITY");
+  number("lastLba",capacity.lastLba); number("blockBytes",capacity.blockBytes);
+  puts("PASS READ CAPACITY\n");
   const unsigned blockCounts[]={1,32};
   for (unsigned blocks: blockCounts) {
     check(hostRead4k(0,8,blocks,output)==0,"READ10");

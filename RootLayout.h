@@ -11,6 +11,9 @@ struct RootWindow {
 
 struct RootLayout {
   uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0
+  uint32_t lbaBytes;                      // Logical block size reported by the device
+  uint8_t typeGuid[16];                   // GPT partition type GUID, on-disk byte order
+  uint8_t uniqueGuid[16];                 // GPT partition unique GUID, on-disk byte order
   uint64_t imageBytes;                    // size of the flashed root image from the manifest (0 when none)
   uint64_t gptEntriesLba;                 // GPT facts recorded for the persistent store's before/after comparison
   uint32_t gptHeaderCrc, gptEntriesCrc, gptEntryCount;
@@ -20,6 +23,7 @@ struct RootLayout {
   uint32_t magic0, magic1;                // first 8 bytes of the partition's first block
   uint32_t ext4Magic;                     // 16 bits at byte 1080 of the partition (0xef53 on Linux ext4)
   uint32_t ext4Blocks;                    // s_blocks_count_lo at byte 1028
+  uint32_t f2fsMagic;                     // 32 bits at byte 1024 of the partition (0xF2F52010 on Android F2FS)
 };
 
 static uint8_t gScratch[kDataMax];
@@ -32,6 +36,34 @@ static uint32_t le32 (const uint8_t *at)
 static uint64_t le64 (const uint8_t *at)
 {
   return uint64_t (le32 (at)) | (uint64_t (le32 (at + 4)) << 32);
+}
+
+// Format one bounded block window as 16-byte hexadecimal lines. logicalBase is
+// the partition-relative byte offset of block[0], so a second 4 KiB block starts
+// at 0x1000 even though this function receives only that block.
+[[maybe_unused]] static int rootHexWindow (char *out, size_t capacity, const uint8_t *block,
+                                           uint32_t blockBytes, uint32_t offset, uint32_t bytes,
+                                           uint64_t logicalBase)
+{
+  if (!out || !capacity || !block || offset > blockBytes || bytes > blockBytes - offset) return 0;
+  size_t used = 0;
+  for (uint32_t at = offset; at < offset + bytes; at += 16) {
+    unsigned count = offset + bytes - at;
+    if (count > 16) count = 16;
+    int written = snprintf (out + used, capacity - used, "+%08llx:",
+                            (unsigned long long) (logicalBase + at));
+    if (written < 0 || size_t (written) >= capacity - used) return 0;
+    used += size_t (written);
+    for (unsigned index = 0; index < count; ++index) {
+      written = snprintf (out + used, capacity - used, " %02x", block[at + index]);
+      if (written < 0 || size_t (written) >= capacity - used) return 0;
+      used += size_t (written);
+    }
+    written = snprintf (out + used, capacity - used, "\n");
+    if (written < 0 || size_t (written) >= capacity - used) return 0;
+    used += size_t (written);
+  }
+  return int (used);
 }
 
 // GPT uses the reflected IEEE CRC32 polynomial. The header CRC field is zero
@@ -134,6 +166,9 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       }
       layout->userdataFirst = le64 (entry + 32);
       layout->userdataLast = le64 (entry + 40);
+      layout->lbaBytes = 4096;
+      memcpy (layout->typeGuid, entry, 16);
+      memcpy (layout->uniqueGuid, entry + 16, 16);
       found = true;
     }
   }
@@ -153,6 +188,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   layout->magic1 = le32 (gScratch + 4);
   layout->ext4Magic = uint32_t (gScratch[1080]) | (uint32_t (gScratch[1081]) << 8);
   layout->ext4Blocks = le32 (gScratch + 1028);
+  layout->f2fsMagic = le32 (gScratch + 1024);
   layout->manifestStatus = 1;
   if (layout->magic0 == 0x474e4853U && layout->magic1 == 0x544f4f52U) {        // "SHNGROOT"
     uint32_t version = le32 (gScratch + 8), n = le32 (gScratch + 12);

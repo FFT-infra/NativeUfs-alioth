@@ -56,6 +56,11 @@ uint32_t ufs_test_query(uint8_t op,uint8_t idn,uint32_t *value) { return hostQue
 uint32_t ufs_test_scsi(uint8_t lun,const uint8_t *cdb,unsigned length,bool read,uint32_t bytes,uint32_t *scsi) {
   return hostScsi(lun,cdb,length,read,bytes,200000,scsi);
 }
+uint32_t ufs_test_capacity(uint8_t lun,uint32_t *last,uint32_t *bytes,uint32_t *scsi,uint32_t *ocs) {
+  if(!last || !bytes || !scsi || !ocs)return kIOReturnBadArgument;
+  UfsReadCapacity capacity;uint32_t result=hostReadCapacity(lun,&capacity);
+  *last=capacity.lastLba;*bytes=capacity.blockBytes;*scsi=capacity.scsi;*ocs=capacity.ocs;return result;
+}
 uint32_t ufs_test_read(uint8_t lun,uint64_t lba,uint32_t blocks,void *out) { return hostRead4k(lun,lba,blocks,out); }
 uint32_t ufs_test_store_open(uint64_t first,uint64_t blocks) { return hostStoreOpen(first,blocks) ? 1 : 0; }
 uint32_t ufs_test_log_open(uint64_t first,uint64_t blocks) { return hostLogOpen(first,blocks) ? 1 : 0; }
