@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Native sheng SM8550 UFS bring-up. Default-off: no MMIO is touched unless
-// native-ufs-probe=1 is present. This is a register probe, not a storage driver.
+// Native UFS bring-up. Default-off: no MMIO is touched unless a probe or an
+// explicitly selected root route is present.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
@@ -35,6 +35,8 @@ extern const uint8_t verified_root_key[];
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
 #include "SmmuTakeover.h"
+#include "WholeUserdataRoot.h"
+#include "WholeUserdataDisk.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
@@ -84,7 +86,9 @@ static uint16_t ufsStream (void)
 extern "C" {
 // Optional passive observer; absent in ordinary builds. It may run while a
 // window lock is held, so its contract forbids blocking or transport access.
-void boot_progress_poll (void) __attribute__((weak));
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+extern "C" void boot_progress_poll (void) __attribute__((weak_import));
+#endif
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
@@ -113,6 +117,7 @@ class NativeUfs : public IOService {
   void inspectContextBanks (void);
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
   bool startRoot (IOService *provider);
+  bool startWholeUserdataRoot (IOService *provider);
 #endif
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
 public:
@@ -1397,6 +1402,381 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
 // the virtio path.
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
+extern "C" {
+extern volatile uint64_t native_ufs_block_reads;
+extern volatile uint64_t native_ufs_block_failures;
+}
+
+static IOReturn wholeUserdataIoStatus (alioth::whole_userdata_root::Status status)
+{
+  using Status = alioth::whole_userdata_root::Status;
+  switch (status) {
+  case Status::Ok: return kIOReturnSuccess;
+  case Status::NullArgument:
+  case Status::InvalidGeometry:
+  case Status::CapacityMismatch:
+  case Status::MediaLbaOutOfRange:
+  case Status::ZeroLength:
+  case Status::Overflow:
+  case Status::OutOfBounds:
+  case Status::UnalignedMediaBlock:
+  case Status::TransferTooLarge:
+  case Status::InvalidAccess: return kIOReturnBadArgument;
+  case Status::NotReady: return kIOReturnNotReady;
+  case Status::ReadOnly: return kIOReturnNotWritable;
+  case Status::IoError:
+  case Status::End: return kIOReturnIOError;
+  }
+  return kIOReturnIOError;
+}
+
+// The ios-sweet whole-userdata root contract, backed by NativeUfs's already
+// validated UFS transport. It exposes partition-relative 512-byte sectors and
+// keeps every physical operation in 4 KiB units strictly inside GPT userdata.
+class NativeUfsWholeUserdataBlock : public IOBlockStorageDevice {
+  OSDeclareDefaultStructors (NativeUfsWholeUserdataBlock)
+  alioth::whole_userdata_root::Geometry geometry = {};
+  uint8_t *bounce = nullptr;
+  IOLock *ioLock = nullptr;
+  bool online = false;
+  bool writable = false;
+  bool routeOpen = false;
+  char label[16] = {};
+
+  struct Operations {
+    IOMemoryDescriptor *buffer;
+
+    alioth::whole_userdata_root::Status readBlock (uint64_t media_lba, uint8_t *out) {
+      if (hostRootRead4k (0, media_lba, 1, out) != kIOReturnSuccess) {
+        return alioth::whole_userdata_root::Status::IoError;
+      }
+      return alioth::whole_userdata_root::Status::Ok;
+    }
+    alioth::whole_userdata_root::Status writeBlock (uint64_t media_lba, const uint8_t *in, bool fua) {
+      if (hostRootWrite4k (0, media_lba, 1, in, fua) != kIOReturnSuccess) {
+        return alioth::whole_userdata_root::Status::IoError;
+      }
+      return alioth::whole_userdata_root::Status::Ok;
+    }
+    alioth::whole_userdata_root::Status copyIn (uint64_t request_offset, uint8_t *out, uint32_t bytes) {
+      if (!buffer || buffer->readBytes (request_offset, out, bytes) != bytes) {
+        return alioth::whole_userdata_root::Status::IoError;
+      }
+      return alioth::whole_userdata_root::Status::Ok;
+    }
+    alioth::whole_userdata_root::Status copyOut (uint64_t request_offset, const uint8_t *in, uint32_t bytes) {
+      if (!buffer || buffer->writeBytes (request_offset, in, bytes) != bytes) {
+        return alioth::whole_userdata_root::Status::IoError;
+      }
+      return alioth::whole_userdata_root::Status::Ok;
+    }
+    alioth::whole_userdata_root::Status synchronize () {
+      return hostRootSync () == kIOReturnSuccess
+        ? alioth::whole_userdata_root::Status::Ok
+        : alioth::whole_userdata_root::Status::IoError;
+    }
+  };
+
+  IOReturn transfer (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+                     IOStorageAttributes *attributes, IOStorageCompletion *completion,
+                     bool write) {
+    using Disk = alioth::whole_userdata_root::Disk<Operations>;
+    using Status = alioth::whole_userdata_root::Status;
+    if (!buffer || !completion || !completion->action || !online || !ioLock ||
+        count == 0 || block >= geometry.logical_sector_count ||
+        count > geometry.logical_sector_count - block ||
+        count > UINT64_MAX / alioth::whole_userdata_root::kLogicalSectorBytes ||
+        buffer->getLength () < count * alioth::whole_userdata_root::kLogicalSectorBytes) {
+      return kIOReturnBadArgument;
+    }
+    const bool fua = write && attributes &&
+      (attributes->options & kIOStorageOptionForceUnitAccess);
+    const IODirection direction = buffer->getDirection ();
+    if ((!write && direction != kIODirectionIn) ||
+        (write && direction != kIODirectionOut)) {
+      return kIOReturnBadArgument;
+    }
+    if (write && !writable) {
+      return kIOReturnNotWritable;
+    }
+
+    Operations operations = { buffer };
+    uint8_t *bounce_pointer = bounce;
+    Disk disk;
+    Status configured = disk.Configure (geometry, &operations, bounce_pointer, true, writable);
+    if (configured != Status::Ok) {
+      return wholeUserdataIoStatus (configured);
+    }
+
+    IOLockLock (ioLock);
+    uint64_t absolute = geometry.first_logical_sector + block;
+    alioth::whole_userdata_root::DiskResult result = write
+      ? disk.Write (absolute, count, fua)
+      : disk.Read (absolute, count);
+    IOLockUnlock (ioLock);
+
+    const IOReturn status = wholeUserdataIoStatus (result.status);
+    if (status != kIOReturnSuccess) {
+      __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
+    } else if (!write) {
+      __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+    }
+    completion->action (completion->target, completion->parameter, status,
+                        result.bytes_done);
+    return kIOReturnSuccess;
+  }
+
+public:
+  bool configure (const alioth::whole_userdata_root::Geometry &value, bool selectedWritable) {
+    using Status = alioth::whole_userdata_root::Status;
+    if (alioth::whole_userdata_root::ValidateGeometry (value) != Status::Ok ||
+        ioLock || bounce) {
+      return false;
+    }
+    geometry = value;
+    writable = selectedWritable;
+    strlcpy (label, "ufsroot0", sizeof (label));
+    ioLock = IOLockAlloc ();
+    bounce = static_cast<uint8_t *> (IOMalloc (alioth::whole_userdata_root::kMediaBlockBytes));
+    if (!ioLock || !bounce) {
+      if (bounce) {
+        IOFree (bounce, alioth::whole_userdata_root::kMediaBlockBytes);
+        bounce = nullptr;
+      }
+      if (ioLock) {
+        IOLockFree (ioLock);
+        ioLock = nullptr;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  const char *rootLabel () const { return label; }
+  uint64_t mediaBlockCount () const { return geometry.media_block_count; }
+  uint64_t logicalSectorCount () const { return geometry.logical_sector_count; }
+  bool isWritable () const { return writable; }
+
+  bool start (IOService *provider) override {
+    if (online || !ioLock || !bounce ||
+        !hostRootOpen (geometry.first_media_lba, geometry.media_block_count, writable)) {
+      return false;
+    }
+    routeOpen = true;
+    if (!IOBlockStorageDevice::start (provider)) {
+      hostRootClose ();
+      routeOpen = false;
+      return false;
+    }
+    OSString *rootName = OSString::withCString ("ufsroot0");
+    if (rootName) {
+      setProperty ("NativeUFSRootName", rootName);
+      rootName->release ();
+    }
+    online = true;
+    registerService ();
+    return true;
+  }
+
+  void free () override {
+    if (routeOpen) {
+      hostRootClose ();
+      routeOpen = false;
+    }
+    if (bounce) {
+      IOFree (bounce, alioth::whole_userdata_root::kMediaBlockBytes);
+      bounce = nullptr;
+    }
+    if (ioLock) {
+      IOLockFree (ioLock);
+      ioLock = nullptr;
+    }
+    IOBlockStorageDevice::free ();
+  }
+
+  void stop (IOService *provider) override {
+    online = false;
+    if (routeOpen) {
+      hostRootClose ();
+      routeOpen = false;
+    }
+    IOBlockStorageDevice::stop (provider);
+  }
+
+  IOReturn doEjectMedia () override { return kIOReturnUnsupported; }
+  IOReturn doFormatMedia (UInt64) override { return kIOReturnNotWritable; }
+  UInt32 doGetFormatCapacities (UInt64 *, UInt32) const override { return 0; }
+  char *getVendorString () override { return const_cast<char *> ("Native"); }
+  char *getProductString () override { return label; }
+  char *getRevisionString () override { return const_cast<char *> ("1.0"); }
+  char *getAdditionalDeviceInfoString () override {
+    return const_cast<char *> ("NativeUfs whole GPT userdata, 512-byte logical sectors");
+  }
+  IOReturn reportBlockSize (UInt64 *value) override {
+    if (!value) return kIOReturnBadArgument;
+    *value = alioth::whole_userdata_root::kLogicalSectorBytes;
+    return kIOReturnSuccess;
+  }
+  IOReturn reportEjectability (bool *value) override {
+    if (!value) return kIOReturnBadArgument;
+    *value = false;
+    return kIOReturnSuccess;
+  }
+  IOReturn reportMaxValidBlock (UInt64 *value) override {
+    if (!value || !geometry.logical_sector_count) return kIOReturnBadArgument;
+    *value = geometry.logical_sector_count - 1;
+    return kIOReturnSuccess;
+  }
+  IOReturn reportMediaState (bool *present, bool *changed) override {
+    if (!present) return kIOReturnBadArgument;
+    *present = online;
+    if (changed) *changed = false;
+    return kIOReturnSuccess;
+  }
+  IOReturn reportRemovability (bool *value) override {
+    if (!value) return kIOReturnBadArgument;
+    *value = false;
+    return kIOReturnSuccess;
+  }
+  IOReturn reportWriteProtection (bool *value) override {
+    if (!value) return kIOReturnBadArgument;
+    *value = !writable;
+    return kIOReturnSuccess;
+  }
+  IOReturn getWriteCacheState (bool *value) override {
+    if (!value) return kIOReturnBadArgument;
+    *value = writable;
+    return kIOReturnSuccess;
+  }
+  IOReturn setWriteCacheState (bool) override { return kIOReturnUnsupported; }
+  IOReturn doSynchronize (UInt64 block, UInt64 count, IOOptionBits) override {
+    using Status = alioth::whole_userdata_root::Status;
+    if (!online || !ioLock || !writable) {
+      return kIOReturnNotWritable;
+    }
+    // IOBlockStorageDriver uses (0, 0) to request an end-of-media flush. A
+    // non-zero request is still checked for 4K alignment and bounded to one
+    // policy batch before issuing the whole-LUN cache flush.
+    if (count == 0) {
+      if (block != 0) return kIOReturnBadArgument;
+    } else {
+      if (block >= geometry.logical_sector_count ||
+          count > geometry.logical_sector_count - block) {
+        return kIOReturnBadArgument;
+      }
+      alioth::whole_userdata_root::SectorRange accepted = {};
+      Status policy = alioth::whole_userdata_root::ValidateAccess (
+        geometry, alioth::whole_userdata_root::AccessKind::SynchronizeCache,
+        { geometry.first_logical_sector + block, count }, &accepted);
+      if (policy != Status::Ok) {
+        return wholeUserdataIoStatus (policy);
+      }
+    }
+    IOLockLock (ioLock);
+    const IOReturn status = hostRootSync ();
+    IOLockUnlock (ioLock);
+    return status;
+  }
+  IOReturn doSynchronizeCache () override {
+    if (!online || !ioLock || !writable) {
+      return online ? kIOReturnNotWritable : kIOReturnNotReady;
+    }
+    IOLockLock (ioLock);
+    const IOReturn status = hostRootSync ();
+    IOLockUnlock (ioLock);
+    return status;
+  }
+  IOReturn doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+                             IOStorageAttributes *attributes,
+                             IOStorageCompletion *completion) override {
+    const bool write = buffer && buffer->getDirection () == kIODirectionOut;
+    return transfer (buffer, block, count, attributes, completion, write);
+  }
+};
+OSDefineMetaClassAndStructors (NativeUfsWholeUserdataBlock, IOBlockStorageDevice)
+
+// Keeps the selected whole-userdata service alive for the lifetime of the
+// controller personality. The route is deliberately exclusive: it is never
+// created alongside the SHNGROOT store/log windows.
+static NativeUfsWholeUserdataBlock *gWholeUserdataDevice = nullptr;
+static bool gWholeUserdataRenameDone;
+
+static bool ufsHasAncestor (IORegistryEntry *entry, const IORegistryEntry *ancestor)
+{
+  IORegistryIterator *parents = IORegistryIterator::iterateOver (
+    entry, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
+  if (!parents) return false;
+  const bool found = ufsMediaHasAncestor (*parents, ancestor);
+  parents->release ();
+  return found;
+}
+
+// IOBlockStorageDriver publishes a normal IOMedia and IOMediaBSDClient assigns
+// diskX after that. Override the final BSD name only after this media is
+// reachable from our exact whole-userdata block device.
+static void renameWholeUserdataThread (void *, wait_result_t)
+{
+  NativeUfsWholeUserdataBlock *device = gWholeUserdataDevice;
+  if (!device) return;
+  device->retain ();
+
+  bool observedAssignedName = false;
+  for (unsigned tick = 0; tick < 300; ++tick) {
+    bool renamedThisTick = false;
+    OSDictionary *matching = IOService::serviceMatching ("IOMedia");
+    OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
+    if (iterator) {
+      while (IOMedia *media = OSDynamicCast (IOMedia, iterator->getNextObject ())) {
+        if (!media->isWhole () || !ufsHasAncestor (media, device)) continue;
+        OSString *oldName = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
+        if (!oldName || !oldName->getLength ()) continue;
+        observedAssignedName = true;
+        if (!strcmp (oldName->getCStringNoCopy (), "ufsroot0")) {
+          continue;
+        }
+        OSString *newName = OSString::withCString ("ufsroot0");
+        if (!newName) continue;
+        media->setProperty (kIOBSDNameKey, newName);
+        newName->release ();
+        IOLog ("NativeUfs: whole-userdata IOMedia BSD name %s -> ufsroot0 entry=%llu\n",
+               oldName->getCStringNoCopy (), media->getRegistryEntryID ());
+        renamedThisTick = true;
+      }
+      iterator->release ();
+    }
+    OSSafeReleaseNULL (matching);
+    if (observedAssignedName) {
+      // Verify on a later tick so a racing IOMediaBSDClient assignment can be
+      // detected and corrected before root selection.
+      if (OSDictionary *verifyMatch = IOService::serviceMatching ("IOMedia")) {
+        OSIterator *verify = IOService::getMatchingServices (verifyMatch);
+        bool assigned = false;
+        if (verify) {
+          while (IOMedia *media = OSDynamicCast (IOMedia, verify->getNextObject ())) {
+            if (!media->isWhole () || !ufsHasAncestor (media, device)) continue;
+            OSString *name = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
+            if (name && name->getLength () && !strcmp (name->getCStringNoCopy (), "ufsroot0")) {
+              assigned = true;
+              break;
+            }
+          }
+          verify->release ();
+        }
+        OSSafeReleaseNULL (verifyMatch);
+        if (assigned && !renamedThisTick) {
+          __atomic_store_n (&gWholeUserdataRenameDone, true, __ATOMIC_RELEASE);
+          break;
+        }
+      }
+    }
+    IOSleep (100);
+  }
+  if (!__atomic_load_n (&gWholeUserdataRenameDone, __ATOMIC_ACQUIRE)) {
+    IOLog ("NativeUfs: whole-userdata BSD rename timed out\n");
+  }
+  device->release ();
+}
+
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
   uint64_t absolute = 0;      // byte offset of the window on LUN 0
@@ -1482,6 +1862,19 @@ static void rootDiagnosticFailure (const char *reason)
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
   panic ("%s", gRootDiagnosticText);
+}
+
+static IOReturn rootPublishResult (UfsRootPhase phase)
+{
+  switch (phase) {
+  case UfsRootPhase::Identity: return kIOReturnNotPrivileged;
+  case UfsRootPhase::Schedule: return kIOReturnNoResources;
+  case UfsRootPhase::Prepare: return kIOReturnError;
+  case UfsRootPhase::Start: return kIOReturnIOError;
+  case UfsRootPhase::Media: return kIOReturnTimeout;
+  case UfsRootPhase::Complete: return kIOReturnSuccess;
+  }
+  return kIOReturnError;
 }
 
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
@@ -1671,10 +2064,14 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
       __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
       return r;
+#else
+      return hostRead4k (0, lba, blocks, out);
+#endif
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
@@ -1735,6 +2132,119 @@ void NativeUfsBlock::free ()
   IOBlockStorageDevice::free ();
 }
 
+// Select the whole GPT userdata partition as a 512-byte-sector block device.
+// This is a separate, explicit route from the SHNGROOT window path: it does
+// not require a SHNGROOT manifest, but it only runs after the board opts in
+// and the first block identifies an HFS+ or HFSX volume. The route stays
+// read-only unless ufsrw=1 is present, and hostRootOpen then confines every
+// data operation to the exact GPT range.
+bool NativeUfs::startWholeUserdataRoot (IOService *provider)
+{
+  uint32_t writableArg = 0;
+  PE_parse_boot_argn ("ufsrw", &writableArg, sizeof (writableArg));
+  if (writableArg > 1) {
+    rootDiagnosticFailure ("ufsrw must be 0 or 1");
+    return false;
+  }
+  const bool writable = writableArg == 1;
+
+  const char *why = "";
+  native_ufs_root_step = 1;
+  if (!hostBringUp (&why)) {
+    rootDiagnosticFailure (why);
+    IOLog ("NativeUfs: whole-userdata bring-up failed: %s\n", why);
+    return false;
+  }
+
+  native_ufs_root_step = 2;
+  RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
+  if (!layout || !findRootLayout (layout, &why)) {
+    rootDiagnosticFailure (layout ? why : "whole-userdata layout allocation failed");
+    IOLog ("NativeUfs: whole-userdata layout failed: %s\n", why);
+    if (layout) IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+
+  if (layout->lbaBytes != alioth::whole_userdata_root::kMediaBlockBytes) {
+    rootDiagnosticFailure ("whole-userdata media block size is not 4 KiB");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  if (layout->hfsMagic != 0x482b && layout->hfsMagic != 0x4858) {
+    rootDiagnosticFailure ("whole-userdata first block is not HFS+");
+    IOLog ("NativeUfs: whole-userdata refused: HFS magic=%04x first=%llx last=%llx\n",
+           layout->hfsMagic, layout->userdataFirst, layout->userdataLast);
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+
+  const uint64_t mediaBlocks = layout->userdataLast - layout->userdataFirst + 1;
+  uint64_t capacity = 0;
+  if (!alioth::whole_userdata_root::CheckedMultiply (
+        mediaBlocks, alioth::whole_userdata_root::kMediaBlockBytes, &capacity)) {
+    rootDiagnosticFailure ("whole-userdata capacity overflow");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  alioth::whole_userdata_root::Geometry geometry = {};
+  const alioth::whole_userdata_root::Status geometryStatus =
+    alioth::whole_userdata_root::ProjectGeometry (
+      layout->userdataFirst, layout->userdataLast, capacity, &geometry);
+  if (geometryStatus != alioth::whole_userdata_root::Status::Ok) {
+    rootDiagnosticFailure ("whole-userdata GPT geometry rejected");
+    IOLog ("NativeUfs: whole-userdata geometry rejected status=%u first=%llx last=%llx\n",
+           static_cast<unsigned> (geometryStatus), layout->userdataFirst, layout->userdataLast);
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+
+  if (!IOService::start (provider)) {
+    rootDiagnosticFailure ("whole-userdata IOService start failed");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+
+  NativeUfsWholeUserdataBlock *device = OSTypeAlloc (NativeUfsWholeUserdataBlock);
+  if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
+      !device->configure (geometry, writable)) {
+    if (device) device->release ();
+    IOService::stop (provider);
+    rootDiagnosticFailure ("whole-userdata block configuration failed");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  if (!device->attach (this)) {
+    device->release ();
+    IOService::stop (provider);
+    rootDiagnosticFailure ("whole-userdata block attachment failed");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  if (!device->start (this)) {
+    device->detach (this);
+    device->release ();
+    IOService::stop (provider);
+    rootDiagnosticFailure ("whole-userdata block service start failed");
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+
+  gWholeUserdataDevice = device;
+  gWholeUserdataRenameDone = false;
+  thread_t renameThread = nullptr;
+  if (kernel_thread_start (renameWholeUserdataThread, nullptr, &renameThread) != KERN_SUCCESS) {
+    IOLog ("NativeUfs: whole-userdata BSD rename thread creation failed\n");
+  } else {
+    thread_deallocate (renameThread);
+  }
+  native_ufs_root_step = 3;
+  IOLog ("NativeUfs: whole-userdata root published first=%llx last=%llx blocks=%llu logical=%llu writable=%u\n",
+         geometry.first_media_lba, geometry.last_media_lba, geometry.media_block_count,
+         geometry.logical_sector_count, writable ? 1U : 0U);
+  IOFree (layout, sizeof (RootLayout));
+  return true;
+}
+
 // Ordered publication of the root windows. The original owner-trust code resolves the SystemOS
 // volume by UUID immediately after the root is mounted, so SystemOS must already have published its
 // volume media by then; the OS window (whose volume is the root being waited for) goes last.
@@ -1780,16 +2290,22 @@ static void captureMissingMedia (const char *uuid)
   OSDictionary *matching = IOService::serviceMatching ("IOMedia");
   OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
   unsigned count = 0;
-  while (iterator && used < int (sizeof (gRootMediaText)) - 180 && count++ < 8) {
+  while (iterator && used >= 0 && static_cast<size_t> (used) < sizeof (gRootMediaText) - 180 &&
+         count++ < 8) {
     IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
     if (!media) break;
     OSString *id = OSDynamicCast (OSString, media->getProperty ("UUID"));
     OSString *bsd = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
     OSNumber *size = OSDynamicCast (OSNumber, media->getProperty ("Size"));
-    used += snprintf (gRootMediaText + used, sizeof (gRootMediaText) - used,
-                      "media %.24s bytes=%llx uuid=%.36s\n",
-                      bsd ? bsd->getCStringNoCopy () : "-", size ? size->unsigned64BitValue () : 0ULL,
-                      id ? id->getCStringNoCopy () : "-");
+    const int written = snprintf (gRootMediaText + used, sizeof (gRootMediaText) - static_cast<size_t> (used),
+                                  "media %.24s bytes=%llx uuid=%.36s\n",
+                                  bsd ? bsd->getCStringNoCopy () : "-",
+                                  size ? size->unsigned64BitValue () : 0ULL,
+                                  id ? id->getCStringNoCopy () : "-");
+    if (written < 0 || static_cast<size_t> (written) >= sizeof (gRootMediaText) - static_cast<size_t> (used)) {
+      break;
+    }
+    used += written;
   }
   OSSafeReleaseNULL (iterator);
   OSSafeReleaseNULL (matching);
@@ -1841,7 +2357,7 @@ static void publishThread (void *, wait_result_t)
   } operations;
   UfsRootPublicationResult result = ufsPublishRootWindows (operations, gPublicationPlan);
   if (result.phase != UfsRootPhase::Complete) {
-    gRootDiagnostic.result = result.phase == UfsRootPhase::Start ? kIOReturnIOError : kIOReturnTimeout;
+    gRootDiagnostic.result = static_cast<uint32_t> (rootPublishResult (result.phase));
     const char *reason = result.phase == UfsRootPhase::Start ? "root window service start failed" :
       (!strcmp (gPendingDevice[result.index]->windowLabel (), "SystemOS") ?
        "SystemOS signed volume not found" : "signed root window volume not found");
@@ -1909,7 +2425,7 @@ static void mediaReportThread (void *, wait_result_t)
                        native_ufs_blocks_published, native_ufs_block_reads, native_ufs_block_failures, count);
   OSDictionary *matching = IOService::serviceMatching ("IOMedia");
   OSIterator *iterator = matching ? IOService::getMatchingServices (matching) : nullptr;
-  while (iterator && used < int (sizeof (gMediaReport)) - 200) {
+  while (iterator && used >= 0 && static_cast<size_t> (used) < sizeof (gMediaReport) - 200) {
     IOService *media = OSDynamicCast (IOService, iterator->getNextObject ());
     if (!media) {
       break;
@@ -1918,9 +2434,16 @@ static void mediaReportThread (void *, wait_result_t)
     OSString *bsd = OSDynamicCast (OSString, media->getProperty (kIOBSDNameKey));
     OSString *content = OSDynamicCast (OSString, media->getProperty ("Content"));
     OSNumber *size = OSDynamicCast (OSNumber, media->getProperty ("Size"));
-    used += snprintf (gMediaReport + used, sizeof (gMediaReport) - used, "%s %s size=%llx uuid=%s\n",
-                      bsd ? bsd->getCStringNoCopy () : "-", content ? content->getCStringNoCopy () : "-",
-                      size ? size->unsigned64BitValue () : 0ULL, uuid ? uuid->getCStringNoCopy () : "-");
+    const int written = snprintf (gMediaReport + used, sizeof (gMediaReport) - static_cast<size_t> (used),
+                                  "%s %s size=%llx uuid=%s\n",
+                                  bsd ? bsd->getCStringNoCopy () : "-",
+                                  content ? content->getCStringNoCopy () : "-",
+                                  size ? size->unsigned64BitValue () : 0ULL,
+                                  uuid ? uuid->getCStringNoCopy () : "-");
+    if (written < 0 || static_cast<size_t> (written) >= sizeof (gMediaReport) - static_cast<size_t> (used)) {
+      break;
+    }
+    used += written;
   }
   if (iterator) {
     iterator->release ();
@@ -1934,23 +2457,38 @@ static void mediaReportThread (void *, wait_result_t)
 
 bool NativeUfs::start (IOService *provider)
 {
-  unsigned probe = 0, rootMode = 0;
+  unsigned probe = 0, rootMode = 0, wholeUserdataRoot = 0;
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
+  bool hasWholeUserdataRoot =
+    PE_parse_boot_argn ("native-ufs-whole-userdata-root", &wholeUserdataRoot, sizeof (wholeUserdataRoot));
+  if (hasWholeUserdataRoot && wholeUserdataRoot > 1) {
+    IOLog ("NativeUfs: native-ufs-whole-userdata-root must be 0 or 1 (got %u)\n", wholeUserdataRoot);
+    return false;
+  }
+  // The HFS whole-userdata route and the SHNGROOT window route must never
+  // publish two root personalities at once. Probes are also exclusive so a
+  // diagnostic run cannot be mistaken for a requested root.
+  if (wholeUserdataRoot && (probe || rootMode)) {
+    IOLog ("NativeUfs: native-ufs-whole-userdata-root conflicts with probe=%u root=%u\n",
+           probe, rootMode);
+    return false;
+  }
   UfsStreamConfig streams = ufsStreams ();
-  IOLog ("NativeUfs: start provider=%s probe=%u root=%u stream=%04x stream2=%04x\n",
+  IOLog ("NativeUfs: start provider=%s probe=%u root=%u whole-root=%u stream=%04x stream2=%04x\n",
          provider && OSDynamicCast (IOPlatformExpertDevice, provider) ? "platform" : "device",
-         probe, rootMode, streams.primary, streams.secondary);
+         probe, rootMode, wholeUserdataRoot, streams.primary, streams.secondary);
   native_ufs_probe_requested = probe != 0;
   bool mutatesTransport = (probe >= 3 && probe <= 5) || probe == 9 || probe == 10 ||
                           probe == 11 || probe == 12 || probe == 13 ||
-                          (rootMode && !probe);
+                          (rootMode && !probe) || wholeUserdataRoot;
   if (streams.secondary && mutatesTransport) {
-    requireDualStreamReuse (probe, rootMode, "start");
+    requireDualStreamReuse (probe, rootMode ? rootMode : wholeUserdataRoot, "start");
   }
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
-  if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
+  if ((!probe && !rootMode && !wholeUserdataRoot) ||
+      !OSDynamicCast (IOPlatformExpertDevice, provider)) {
     return false;
   }
   unsigned diagnostic = 0;
@@ -2138,6 +2676,9 @@ bool NativeUfs::start (IOService *provider)
   if (rootMode && !probe) {
     return startRoot (provider);
   }
+  if (wholeUserdataRoot) {
+    return startWholeUserdataRoot (provider);
+  }
 #endif
   return false;
 }
@@ -2241,8 +2782,7 @@ bool NativeUfs::startRoot (IOService *provider)
   IOFree (layout, sizeof (RootLayout));
   if (result.phase != UfsRootPhase::Complete) {
     gPending = 0;
-    gRootDiagnostic.result = result.phase == UfsRootPhase::Identity ? kIOReturnNotPrivileged :
-      result.phase == UfsRootPhase::Schedule ? kIOReturnNoResources : kIOReturnError;
+    gRootDiagnostic.result = static_cast<uint32_t> (rootPublishResult (result.phase));
     IOLog ("NativeUfs: root preparation failed phase=%u window=%u; nothing published\n",
            static_cast<unsigned> (result.phase), result.index);
     IOService::stop (provider);
@@ -2257,6 +2797,15 @@ bool NativeUfs::startRoot (IOService *provider)
 
 void NativeUfs::stop (IOService *provider)
 {
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
+  if (gWholeUserdataDevice) {
+    NativeUfsWholeUserdataBlock *device = gWholeUserdataDevice;
+    gWholeUserdataDevice = nullptr;
+    device->terminate ();
+    device->detach (this);
+    device->release ();
+  }
+#endif
   fCmdDesc.reset ();
   fMap.reset ();
   IOService::stop (provider);

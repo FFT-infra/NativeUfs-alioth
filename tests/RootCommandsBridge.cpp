@@ -10,7 +10,8 @@
 using IOReturn = uint32_t;
 constexpr IOReturn kIOReturnSuccess=0, kIOReturnError=0xe00002bc,
   kIOReturnBadArgument=0xe00002c2, kIOReturnIOError=0xe00002ca,
-  kIOReturnBusy=0xe00002d5, kIOReturnTimeout=0xe00002d6, kIOReturnNotReady=0xe00002d8;
+  kIOReturnBusy=0xe00002d5, kIOReturnTimeout=0xe00002d6,
+  kIOReturnNotWritable=0xe00002cf, kIOReturnNotReady=0xe00002d8;
 #include "../RootTransportLayout.h"
 constexpr unsigned kMicrosecondScale=1;
 constexpr unsigned kMillisecondScale=1000;
@@ -46,7 +47,8 @@ extern "C" {
 void ufs_test_reset(Callback cb, uint64_t physical) {
   callback=cb; memset(memory,0,sizeof(memory));
   gHost={memory,physical,true,false,0,nullptr}; gRootDiagnostic=UfsRootDiagnostics{};
-  gStoreOpen=gLogOpen=false; gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=0;
+  gStoreOpen=gLogOpen=gRootOpen=gRootWritable=false;
+  gStoreFirst=gStoreBlocks=gLogFirst=gLogBlocks=gRootFirst=gRootBlocks=0;
 }
 uint8_t *ufs_test_memory() { return memory; }
 bool ufs_test_poisoned() { return gHost.poisoned; }
@@ -64,6 +66,11 @@ uint32_t ufs_test_capacity(uint8_t lun,uint32_t *last,uint32_t *bytes,uint32_t *
 uint32_t ufs_test_read(uint8_t lun,uint64_t lba,uint32_t blocks,void *out) { return hostRead4k(lun,lba,blocks,out); }
 uint32_t ufs_test_store_open(uint64_t first,uint64_t blocks) { return hostStoreOpen(first,blocks) ? 1 : 0; }
 uint32_t ufs_test_log_open(uint64_t first,uint64_t blocks) { return hostLogOpen(first,blocks) ? 1 : 0; }
+uint32_t ufs_test_root_open(uint64_t first,uint64_t blocks,bool writable) { return hostRootOpen(first,blocks,writable) ? 1 : 0; }
+void ufs_test_root_close() { hostRootClose(); }
+uint32_t ufs_test_root_read(uint64_t lba,uint32_t blocks,void *out) { return hostRootRead4k(0,lba,blocks,out); }
+uint32_t ufs_test_root_write(uint64_t lba,uint32_t blocks,const void *src) { return hostRootWrite4k(0,lba,blocks,src,false); }
+uint32_t ufs_test_root_sync() { return hostRootSync(); }
 uint32_t ufs_test_write(uint8_t lun,uint64_t lba,uint32_t blocks,const void *src) { return hostWrite4k(lun,lba,blocks,src); }
 uint32_t ufs_test_sync() { return hostSyncCache(); }
 uint32_t ufs_test_nop() {

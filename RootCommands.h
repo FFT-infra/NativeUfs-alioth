@@ -28,7 +28,7 @@ static uint32_t loadBe32 (const uint8_t *at)
 
 // Issue the UPIU already placed at gHost.virt + kUcdOffset through request slot 0. `direction` is
 // the UTRD data direction (0 none, 1 from host, 2 to host). Direction 1 is reachable only through hostWrite4k, which
-// confines it to the persistent store window. Returns the overall command status
+// confines it to the selected store/log or whole-userdata window. Returns the overall command status
 // (0 = completed) in *ocs. Timeout/fatal status quarantines the allocation.
 static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint32_t *ocs)
 {
@@ -286,16 +286,18 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   return status;
 }
 
-// ---- Persistent store and log windows ------------------------------------------------------------------------------
-// The only place this driver writes. At most two windows of 4096-byte LBAs on LUN 0 (the Data store and the diagnostic log),
-// each opened once by its integration after it has proved that the window lies inside the userdata partition and clear of the
-// root image; every write is checked against them again here, so nothing outside them can be written even if a caller is wrong.
+// ---- Persistent store, log and whole-userdata windows ---------------------------------------------------------------
+// The only places this driver writes. The store and log windows are mutually exclusive with the whole-userdata root
+// route. Every write is checked again here, so a caller cannot escape the window it selected even if its own range logic
+// is wrong.
 static bool gStoreOpen = false, gLogOpen = false;
+static bool gRootOpen = false, gRootWritable = false;
 static uint64_t gStoreFirst = 0, gStoreBlocks = 0, gLogFirst = 0, gLogBlocks = 0;
+static uint64_t gRootFirst = 0, gRootBlocks = 0;
 
 static bool hostLogOpen (uint64_t first, uint64_t blocks)
 {
-  if (gLogOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
+  if (gLogOpen || gRootOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
   if (gStoreOpen && first < gStoreFirst + gStoreBlocks && gStoreFirst < first + blocks) return false;
   gLogFirst = first;
   gLogBlocks = blocks;
@@ -305,13 +307,17 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
 
 static bool hostInWindow (uint64_t lba, uint32_t blocks)
 {
+  if (gRootOpen) {
+    return lba >= gRootFirst && lba - gRootFirst < gRootBlocks &&
+           blocks <= gRootBlocks - (lba - gRootFirst);
+  }
   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
   return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
 }
 
 static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 {
-  if (gStoreOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
+  if (gStoreOpen || gRootOpen || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
   if (gLogOpen && first < gLogFirst + gLogBlocks && gLogFirst < first + blocks) return false;
   gStoreFirst = first;
   gStoreBlocks = blocks;
@@ -339,12 +345,61 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
 static IOReturn hostSyncCache (void)
 {
-  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
+  if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gRootOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
   IOLockUnlock (gHost.lock);
   return status;
+}
+
+// Open the one whole-partition root route. It cannot overlap the SHNGROOT
+// store/log windows, and read-only selection is represented explicitly.
+[[maybe_unused]] static bool hostRootOpen (uint64_t first, uint64_t blocks, bool writable)
+{
+  if (gRootOpen || gStoreOpen || gLogOpen || !blocks ||
+      first > 0xffffffffULL || blocks > 0xffffffffULL - first) {
+    return false;
+  }
+  gRootFirst = first;
+  gRootBlocks = blocks;
+  gRootWritable = writable;
+  gRootOpen = true;
+  return true;
+}
+
+[[maybe_unused]] static void hostRootClose (void)
+{
+  gRootOpen = false;
+  gRootWritable = false;
+  gRootFirst = 0;
+  gRootBlocks = 0;
+}
+
+static bool hostInRoot (uint64_t lba, uint32_t blocks)
+{
+  return gRootOpen && blocks && lba >= gRootFirst &&
+         lba - gRootFirst < gRootBlocks &&
+         blocks <= gRootBlocks - (lba - gRootFirst);
+}
+
+[[maybe_unused]] static IOReturn hostRootRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
+{
+  if (lun != 0 || !hostInRoot (lba, blocks)) return kIOReturnBadArgument;
+  return hostRead4k (lun, lba, blocks, dst);
+}
+
+[[maybe_unused]] static IOReturn hostRootWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua)
+{
+  if (lun != 0 || !hostInRoot (lba, blocks)) return kIOReturnBadArgument;
+  if (!gRootWritable) return kIOReturnNotWritable;
+  return hostWrite4k (lun, lba, blocks, src, fua);
+}
+
+[[maybe_unused]] static IOReturn hostRootSync (void)
+{
+  if (!gRootOpen || !gRootWritable) return kIOReturnNotWritable;
+  return hostSyncCache ();
 }
 

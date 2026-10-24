@@ -76,6 +76,63 @@ static void assertQuarantined()
   assert(writes==oldWrites && releases==oldReleases);
   assert(!memcmp(old.data(),memory,sizeof(memory)));
 }
+static void testWholeUserdataRouting()
+{
+  std::array<uint8_t,4096> out;
+  std::array<uint8_t,4096> src;
+  out.fill(0xa5);
+  src.fill(0x5a);
+
+  reset();
+  assert(ufs_test_root_open(0x100,4,false));
+  assert(!ufs_test_root_open(0x100,4,true));
+  assert(!ufs_test_store_open(0x200,1));
+  assert(!ufs_test_log_open(0x200,1));
+  assert(ufs_test_root_read(0x100,1,out.data())==0);
+  assert(out[0]==0x7b);
+  auto oldWrites=writes, oldReleases=releases;
+  assert(ufs_test_root_read(0x0ff,1,out.data())==kIOReturnBadArgument);
+  assert(ufs_test_root_read(0x103,2,out.data())==kIOReturnBadArgument);
+  assert(ufs_test_root_write(0x100,1,src.data())==kIOReturnNotWritable);
+  assert(ufs_test_root_sync()==kIOReturnNotWritable);
+  assert(writes==oldWrites && releases==oldReleases);
+  ufs_test_root_close();
+  assert(ufs_test_root_read(0x100,1,out.data())==kIOReturnBadArgument);
+
+  reset();
+  assert(ufs_test_store_open(0x100,4));
+  assert(!ufs_test_root_open(0x100,4,true));
+  reset();
+  assert(ufs_test_log_open(0x100,4));
+  assert(!ufs_test_root_open(0x100,4,true));
+
+  reset();
+  assert(ufs_test_root_open(0x200,3,true));
+  assert(!ufs_test_store_open(0x200,1));
+  assert(!ufs_test_log_open(0x200,1));
+  oldWrites=writes; oldReleases=releases;
+  assert(ufs_test_root_write(0x200,1,src.data())==0);
+  assert(writes > oldWrites);
+  oldWrites=writes;
+  assert(ufs_test_root_write(0x202,2,src.data())==kIOReturnBadArgument);
+  assert(writes==oldWrites);
+  assert(ufs_test_root_sync()==0);
+  ufs_test_root_close();
+}
+
+static void testWholeUserdataReadOnly()
+{
+  std::array<uint8_t,4096> out;
+  reset();
+  assert(ufs_test_root_open(0x100,4,false));
+  assert(ufs_test_root_read(0x100,1,out.data())==0);
+  assert(out[0]==0x7b);
+  auto oldWrites=writes, oldReleases=releases;
+  assert(ufs_test_root_write(0x100,1,out.data())==kIOReturnNotWritable);
+  assert(ufs_test_root_sync()==kIOReturnNotWritable);
+  assert(writes==oldWrites && releases==oldReleases);
+  ufs_test_root_close();
+}
 int main()
 {
   reset(); assert(ufs_test_nop()==0);
@@ -120,5 +177,7 @@ int main()
   reset(Fault::HighBase); assert(ufs_test_stop_queue()); assert(!ufs_test_start_queue());
   reset(); assert(ufs_test_stop_queue() && ufs_test_start_queue());
   assert(registers[0x50/4]==0xcb5e9000 && registers[0x54/4]==8);
-  puts("PASS: actual command/queue path; malformed DMA responses, bounds, short reads, sense, quarantine, queue refusal and full-width DMA");
+  testWholeUserdataRouting();
+  testWholeUserdataReadOnly();
+  puts("PASS: actual command/queue path and whole-userdata root window; malformed DMA responses, bounds, short reads, sense, quarantine, queue refusal and full-width DMA");
 }
