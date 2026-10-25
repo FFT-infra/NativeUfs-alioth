@@ -1864,6 +1864,10 @@ static void rootDiagnosticFailure (const char *reason)
   panic ("%s", gRootDiagnosticText);
 }
 
+// UfsRootPhase comes from RootPublication.h, which a probe-only build leaves out, and every caller of
+// this mapping is itself inside the block-publication region. Guard it with them so the probe-only
+// subset still compiles.
+#if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 static IOReturn rootPublishResult (UfsRootPhase phase)
 {
   switch (phase) {
@@ -1876,6 +1880,7 @@ static IOReturn rootPublishResult (UfsRootPhase phase)
   }
   return kIOReturnError;
 }
+#endif
 
 #if !defined(NATIVE_UFS_PROBE_ONLY) || !NATIVE_UFS_PROBE_ONLY
 bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint64_t size)
@@ -2679,6 +2684,34 @@ bool NativeUfs::start (IOService *provider)
   if (wholeUserdataRoot) {
     return startWholeUserdataRoot (provider);
   }
+#endif
+#if defined(NATIVE_UFS_PROBE_ONLY) && NATIVE_UFS_PROBE_ONLY
+  // Probe-only build: no block device to publish, but the log writer still needs the transport and the
+  // userdata geometry. Bring those up without creating any IOBlockStorageDevice.
+  if (!rootMode && !wholeUserdataRoot) return false;
+  const char *why = "";
+  if (!hostBringUp (&why)) {
+    IOLog ("NativeUfs: log-only bring-up failed: %s\n", why);
+    return false;
+  }
+  RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
+  if (!layout || !findRootLayout (layout, &why)) {
+    IOLog ("NativeUfs: log-only root layout failed: %s\n", why);
+    if (layout) IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  bool usable = layout->manifestStatus == 0;
+  if (usable) {
+    gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
+                       layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+  }
+  IOFree (layout, sizeof (RootLayout));
+  if (!usable) {
+    IOLog ("NativeUfs: log-only root manifest rejected; the log window stays closed\n");
+    return false;
+  }
+  // Nothing to publish, so there is no child to start. Keep the personality alive for the log writer.
+  return IOService::start (provider);
 #endif
   return false;
 }
