@@ -207,13 +207,20 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   OSData *data = OSDynamicCast (OSData, property);
   OSString *string = OSDynamicCast (OSString, property);
   bool match = false;
+  // The board tree names the controller with its own SoC string. sm8250 publishes
+  // "qcom,sm8250-ufshc", which is neither "qcom,sm8550-ufshc" nor a superstring of
+  // "qcom,ufshc", so listing only the SM8550 identity made probe() return nullptr on
+  // every alioth boot and start() never ran. The transport below is addressed by
+  // physical windows (GccUfs.h), not by the match, so the same code serves both SiPs.
   if (data) {
     const char *text = static_cast<const char *> (data->getBytesNoCopy ());
     match = text && (contains (text, data->getLength (), "qcom,sm8550-ufshc") ||
+                     contains (text, data->getLength (), "qcom,sm8250-ufshc") ||
                      contains (text, data->getLength (), "qcom,ufshc"));
   } else if (string) {
     const char *text = string->getCStringNoCopy ();
     match = text && (contains (text, string->getLength (), "qcom,sm8550-ufshc") ||
+                     contains (text, string->getLength (), "qcom,sm8250-ufshc") ||
                      contains (text, string->getLength (), "qcom,ufshc"));
   }
   if (!match) {
@@ -2494,6 +2501,16 @@ bool NativeUfs::start (IOService *provider)
   // from the root-device personality; the ufshc nub match stays observation-only.
   if ((!probe && !rootMode && !wholeUserdataRoot) ||
       !OSDynamicCast (IOPlatformExpertDevice, provider)) {
+    return false;
+  }
+  // Past this point the call is going to touch the controller. The catalog publishes two
+  // personalities that both name this class, so this can be entered twice; the bring-up below
+  // rewrites UTRLBA/UTRLBAU, the doorbell and the SMMU S2CR/SMR entries, and a second pass over
+  // a queue that is already running is what deadlocked the transport on sheng. Take the gate
+  // here, not at function entry: the observation-only path above must stay free to run first.
+  static bool hardwareOwnerTaken = false;
+  if (__atomic_exchange_n (&hardwareOwnerTaken, true, __ATOMIC_ACQ_REL)) {
+    IOLog ("NativeUfs: start re-entered; the transport is owned by the first entry\n");
     return false;
   }
   unsigned diagnostic = 0;
