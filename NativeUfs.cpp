@@ -1415,6 +1415,50 @@ extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const voi
   return 1;
 }
 
+/* Read back the persistent boot log. The writer could always store it, but nothing could read
+ * it, so a reset left the log on the medium with no way to look at it. That is the missing half
+ * of an unattended loop: the console dies with the USB link, and the next boot can print what
+ * the previous one wrote. */
+extern "C" int native_ufs_log_read (uint64_t rel, uint32_t blocks, void *dst)
+{
+  if (!gLogRegionBlocks || !dst || !blocks || rel >= gLogRegionBlocks || blocks > gLogRegionBlocks - rel) return 0;
+  while (blocks) {
+    uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    if (hostRead4k (0, gLogRegionFirst + rel, chunk, dst) != kIOReturnSuccess) return 0;
+    dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
+    rel += chunk;
+    blocks -= chunk;
+  }
+  return 1;
+}
+
+/* Read a byte range of the log window. native_ufs_log_read moves whole 4096-byte blocks and
+ * writes blocks*4096 bytes into dst, so its caller's buffer must hold that much. A caller that
+ * wants one structure out of the first block has no way to say so, and on boot-usb99 that cost
+ * the stack: the header struct (152 bytes) was passed straight in, 4096 bytes of block landed
+ * on the kernel stack, and the copy ran into the guard page (pc in memcpy, lr in hostRead4k,
+ * far = sp + 0x3b0). This variant stages each block through one bounce buffer and copies out
+ * only the bytes asked for, so dst only has to hold length bytes. The bounce buffer is not
+ * reentrant; the only caller is the boot log thread. */
+extern "C" int native_ufs_log_read_bytes (uint64_t offset, uint32_t length, void *dst)
+{
+  if (!gLogRegionBlocks || !dst || !length || offset / 4096 >= gLogRegionBlocks ||
+      (offset + length + 4095) / 4096 > gLogRegionBlocks) return 0;
+  static uint8_t bounce[4096];
+  uint8_t *out = static_cast<uint8_t *> (dst);
+  while (length) {
+    const uint64_t block = offset / 4096;
+    const uint32_t within = static_cast<uint32_t> (offset % 4096);
+    uint32_t take = 4096 - within;
+    if (take > length) take = length;
+    if (!native_ufs_log_read (block, 1, bounce)) return 0;
+    memcpy (out, bounce + within, take);
+    out += take;
+    offset += take;
+    length -= take;
+  }
+  return 1;
+}
 extern "C" int native_ufs_log_sync (void)
 {
   return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
@@ -2117,6 +2161,22 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+      /* Measurement gate, not a shipping option: with secondary CPUs up the board reports
+       * "lost rootfs integrity" and publishes no root at all, which is either a real
+       * concurrency defect in this read/verify/copy snapshot or a fault in the transport.
+       * Turning the per-block hash off separates the two: if the volume mounts with the gate
+       * off, the snapshot is being torn and the fingerprint is telling the truth; if it still
+       * fails, the data itself is wrong and the hash was the messenger. */
+      static int verifyGate = -1;
+      if (verifyGate < 0) {
+        unsigned on = 1;
+        PE_parse_boot_argn ("native-ufs-verify", &on, sizeof (on));
+        verifyGate = on != 0;
+      }
+      if (!verifyGate) {
+        __atomic_fetch_add (&native_ufs_verified_blocks, 1, __ATOMIC_RELAXED);
+        return kIOReturnSuccess;
+      }
       uint64_t t0 = timerTicks ();
       int status = vr_verify_block (view, index, data, length, &vr_xnu_crypto);
       __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
