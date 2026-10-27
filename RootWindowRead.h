@@ -3,6 +3,15 @@
 // Shared production window reader. Ops owns synchronization, block I/O,
 // integrity verification and copying to the caller. No callback runs under
 // this guard: the IOKit wrapper completes the request after this returns.
+// The boot progress layer, when the kernel links it. Weak so the host test, which has no such
+// layer, compiles and links this header unchanged; taking the address is what keeps that
+// testable, because a bare call of a static declaration has internal linkage and no body.
+#if defined (__APPLE__) && defined (KERNEL)
+extern "C" void boot_progress_poll (void) __attribute__ ((weak_import));
+#define UFS_PROGRESS_POLL() do { if (&boot_progress_poll) boot_progress_poll (); } while (0)
+#else
+#define UFS_PROGRESS_POLL() do { } while (0)
+#endif
 static bool ufsWindowGeometry (uint64_t absolute, uint64_t bytes)
 {
   constexpr uint64_t limit = (uint64_t (UINT32_MAX) + 1) * 4096;
@@ -42,6 +51,12 @@ static UfsWindowResult ufsReadWindow (Ops &ops, uint64_t absolute, uint64_t byte
       if (result.status != kIOReturnSuccess) break;
     }
     if (result.status != kIOReturnSuccess) break;
+    /* One progress poll per transport command, not one per 4 KiB block. It was inside
+     * ops.verify(), so a full-window command took 32 lock acquisitions of the progress
+     * mutex; the counter it reports only moves once per block and the panel reads it once a
+     * second, so the extra 31 were pure cost. The macro is empty in the host test, which has
+     * no progress layer. */
+    UFS_PROGRESS_POLL ();
     uint64_t usable = blocks * 4096 - skip;
     if (usable > remaining) usable = remaining;
     uint64_t copied = ops.copy (result.done, bounce + skip, usable);

@@ -554,8 +554,29 @@ void NativeUfs::adoptAndRead (unsigned level)
     write32 (hc, 0x20, 0xffffffffU);
     write32 (hc, 0x58, 1);          // ring slot 0
     UfsResult result = { 0xf, 0xff, 0xff, 0, 0, 0 };
+    /* Completion is polled on the doorbell bit. IODelay(1) is not a 1 us wait here: on arm
+     * delay_for_interval spins only when ml_delay_should_spin says the interval is below the
+     * CPU's idle latency, and that latency comes from the ADT powergate-latency property,
+     * which this board's device tree does not carry, so it stays 0 and every IODelay blocks
+     * the thread until the next timer tick, ~830 us.
+     *
+     * Measured 2026-10-27, boot-usb41, same 113 KiB commands: a phase where each command
+     * needed one delay cost 1990 us, a phase where the command was already complete on the
+     * first check cost 331 us. The 1659 us difference is two blocked ticks, not transfer
+     * time. Spin on the register for a bounded window first, so a command that completes in
+     * tens of microseconds is not charged a full tick, and fall back to IODelay only when the
+     * spin budget runs out. The budget is a read count, not a time, so it needs no clock
+     * call inside the loop; at this core's rate it covers well past the 300 us a full-window
+     * command takes. */
     bool done = false;
-    for (unsigned loops = 0; loops < 100000; loops++) {
+    for (unsigned spin = 0; spin < 20000; spin++) {
+      if (!(read32 (hc, 0x58) & 1)) {
+        done = true;
+        break;
+      }
+      __asm__ volatile ("yield" ::: "memory");
+    }
+    for (unsigned loops = 0; !done && loops < 100000; loops++) {
       if (!(read32 (hc, 0x58) & 1)) {
         done = true;
         break;
@@ -605,8 +626,17 @@ void NativeUfs::adoptAndRead (unsigned level)
     cacheClean (virt, 16384);
     write32 (hc, 0x20, 0xffffffffU);
     write32 (hc, 0x58, 1);
+    /* Spin first for the same reason as the read path: IODelay blocks a whole tick on this
+     * board because its device tree carries no powergate latency. */
     bool done = false;
-    for (unsigned loops = 0; loops < 100000; loops++) {
+    for (unsigned spin = 0; spin < 20000; spin++) {
+      if (!(read32 (hc, 0x58) & 1)) {
+        done = true;
+        break;
+      }
+      __asm__ volatile ("yield" ::: "memory");
+    }
+    for (unsigned loops = 0; !done && loops < 100000; loops++) {
       if (!(read32 (hc, 0x58) & 1)) {
         done = true;
         break;
@@ -2097,7 +2127,6 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
         return kIOReturnNotPrivileged;
       }
       __atomic_fetch_add (&native_ufs_verified_blocks, 1, __ATOMIC_RELAXED);
-      if (boot_progress_poll) boot_progress_poll ();
 #else
       (void) index; (void) data; (void) length;
 #endif
