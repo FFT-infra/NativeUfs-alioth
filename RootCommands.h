@@ -326,18 +326,52 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
 }
 
 // WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
-static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+// The write itself, with gHost.lock already held.
+static IOReturn hostWrite4kLocked (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
-    return kIOReturnBadArgument;
-  }
-  IOLockLock (gHost.lock);
   gRootDiagnostic.lba = lba;
   memcpy (gHost.virt + kDataOffset, src, blocks * 4096U);
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
-  IOReturn status = hostScsiDir (0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
+  return hostScsiDir (lun, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
+}
+
+static bool hostWrite4kArgs (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src)
+{
+  return gHost.ready && src && blocks && blocks <= kDataMax / 4096 && lun == 0 && hostInWindow (lba, blocks);
+}
+
+static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+{
+  if (!hostWrite4kArgs (lun, lba, blocks, src)) {
+    return kIOReturnBadArgument;
+  }
+  IOLockLock (gHost.lock);
+  IOReturn status = hostWrite4kLocked (lun, lba, blocks, src, fua);
+  IOLockUnlock (gHost.lock);
+  return status;
+}
+
+// The diagnostic log's write. It must never wait for gHost.lock: every storage operation in this
+// component takes that lock and the completion wait below busy-spins for up to its timeout while
+// holding it, so a logger that queues behind one can outlive the boot it is recording -- which is
+// what fix156 showed, three slots written and then nothing for the rest of the run. A skipped
+// round costs nothing; the writer comes back 2 s later.
+//
+// *busy is set (and kIOReturnBusy returned) when the lock is held. Every other result is the
+// ordinary write result.
+static IOReturn hostWrite4kTry (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool *busy)
+{
+  *busy = false;
+  if (!hostWrite4kArgs (lun, lba, blocks, src)) {
+    return kIOReturnBadArgument;
+  }
+  if (!IOLockTryLock (gHost.lock)) {
+    *busy = true;
+    return kIOReturnBusy;
+  }
+  IOReturn status = hostWrite4kLocked (lun, lba, blocks, src, false);
   IOLockUnlock (gHost.lock);
   return status;
 }
@@ -347,6 +381,19 @@ static IOReturn hostSyncCache (void)
 {
   if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gRootOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
+  uint8_t cdb[10] = { 0x35 };
+  uint32_t scsi = 0;
+  IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
+  IOLockUnlock (gHost.lock);
+  return status;
+}
+
+// The same flush for the diagnostic log, which skips the round instead of waiting for the host lock.
+static IOReturn hostSyncCacheTry (bool *busy)
+{
+  *busy = false;
+  if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gRootOpen)) return kIOReturnNotReady;
+  if (!IOLockTryLock (gHost.lock)) { *busy = true; return kIOReturnBusy; }
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);

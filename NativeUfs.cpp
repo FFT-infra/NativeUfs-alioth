@@ -1408,12 +1408,20 @@ extern "C" int native_ufs_log_open (uint64_t *firstLba, uint64_t *blocks, const 
   return ok;
 }
 
+// The log writer's contract with BootLog.c: 1 written, 0 failed, 2 the host lock was held and the
+// round was skipped. A skip is not an error -- the writer retries 2 s later -- and it is counted so
+// the next slot can say the writer is alive and how often it had to stand down.
+extern "C" volatile uint32_t native_ufs_log_skips = 0;
+
 extern "C" int native_ufs_log_write (uint64_t rel, uint32_t blocks, const void *src)
 {
   if (!gLogRegionBlocks || !src || !blocks || rel >= gLogRegionBlocks || blocks > gLogRegionBlocks - rel) return 0;
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostWrite4k (0, gLogRegionFirst + rel, chunk, src) != kIOReturnSuccess) return 0;
+    bool busy = false;
+    IOReturn status = hostWrite4kTry (0, gLogRegionFirst + rel, chunk, src, &busy);
+    if (busy) { native_ufs_log_skips = native_ufs_log_skips + 1; return 2; }
+    if (status != kIOReturnSuccess) return 0;
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -1484,7 +1492,11 @@ extern "C" int native_ufs_log_read_bytes (uint64_t offset, uint32_t length, void
 }
 extern "C" int native_ufs_log_sync (void)
 {
-  return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+  if (!gLogRegionBlocks) return 0;
+  bool busy = false;
+  IOReturn status = hostSyncCacheTry (&busy);
+  if (busy) { native_ufs_log_skips = native_ufs_log_skips + 1; return 2; }
+  return status == kIOReturnSuccess;
 }
 
 // Re-read the GPT header and entry array and compare their CRCs with what was recorded at root start. 0 = unchanged.
