@@ -90,6 +90,12 @@ extern "C" {
 extern "C" void boot_progress_poll (void) __attribute__((weak_import));
 #endif
 volatile uint32_t native_ufs_probe_calls = 0;
+// The display's stage 1 window (DpuWindow.h). Defined at file scope outside every namespace: the display driver imports them by
+// these names, so an anonymous-namespace definition would have internal linkage and never reach the linker's symbol table.
+// native_ufs_dpu_state bit 31 means "translation installed"; NativeLegacyDisplay checks that bit before it takes the direct path.
+volatile uint32_t native_ufs_dpu_smmu[24] = {};
+volatile uint32_t native_ufs_dpu_state = 0;
+volatile uint32_t native_ufs_dpu_check[8] = {};
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
 volatile uint32_t native_ufs_mapped = 0;
@@ -1034,6 +1040,9 @@ void NativeUfs::inspectContextBanks (void)
 // ======================================================================================
 namespace {
 #include "RootTransportLayout.h"
+#include "DpuWindow.h"
+// Forwarder so the exported entry below (outside every namespace) can reach dpuWindowSetup, which lives in here.
+static int dpuWindowBuild (uintptr_t smmu) { return dpuWindowBuildImpl (smmu); }
 
 struct UfsHost {
   OSSharedPtr<IOMemoryMap> hcMap, smmuMap;
@@ -1171,6 +1180,13 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.cba2r = read32 (gHost.smmu, 0x1800 + 4 * (report[0] >> 16));
   }
   if (!hostStartQueue (why)) return false;
+  // The display's stage 1 window (direct scanout), after the UFS queue is up and not before it. It used to sit above, before
+  // hostStartQueue, and fix85 (the first boot with sheng-dpu-scanout=2) stopped at 18 s with procs=1 -- the window's own fault
+  // watch blocks for up to 50 ms in this thread, and this thread is on the root mount's path, so a display bank that stalls its
+  // read-back also stalls the root. Nothing here may fail the host: a display without zero copy falls back to the GPU copy.
+  // The display's stage-1 window is built here, from the SMMU this function just mapped, and only if the board asked for it. The
+  // board's late probe calls native_ufs_dpu_window_build() itself, before it starts the display, which is the order porting/ufs.md
+  // step 5 and drivers.md section 2 ask for. Nothing here fails the host: a display without zero copy falls back to the GPU copy.
   gRootDiagnostic.stage = "NOP OUT";
   // NOP OUT proves the transport before touching the SCSI layer.
   if (hostNop () != kIOReturnSuccess) {
@@ -1214,6 +1230,13 @@ static bool hostBringUp (const char **why)
   return false;
 }
 }
+
+// The board's entry point for the display window. Outside every namespace, because an extern "C" definition inside the anonymous
+// namespace above would have internal linkage and never reach the symbol table the display imports.
+extern "C" int native_ufs_dpu_window_build (uintptr_t smmu) { return dpuWindowBuild (smmu); }
+
+// The apps_smmu mapping NativeUfs holds, for the board's late probe. 0 until the host has mapped it.
+extern "C" uintptr_t native_ufs_smmu_base (void) { return gHost.smmu; }
 
 namespace {
 static uint32_t be32w (const uint8_t *at)
