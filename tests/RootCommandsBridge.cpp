@@ -36,11 +36,18 @@ static void clock_interval_to_deadline(uint32_t interval, unsigned scale, uint64
 }
 static uint64_t mach_absolute_time() { return callback(4,0,0,nullptr); }
 static void IODelay(uint32_t us) { callback(5,0,us,nullptr); }
+static void spinMicroseconds(uint32_t us) { IODelay(us); }
 static void IOLockLock(void *) {}
 static void IOLockUnlock(void *) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
+// The transfer diagnostics RootCommands.h writes; the kernel build defines these in NativeUfs.cpp.
+static volatile uint32_t native_ufs_diag_step, native_ufs_diag_opcode, native_ufs_diag_type;
+static volatile uint64_t native_ufs_diag_lba;
+static volatile uint32_t native_ufs_last_polls, native_ufs_last_db, native_ufs_last_is, native_ufs_last_ocs;
+static volatile uint64_t native_ufs_lock_owner, native_ufs_lock_wait;
+static uint64_t ufsThreadId (void) { return 0; }
 #include "../RootCommands.h"
 #include "../RootQueue.h"
 extern "C" {

@@ -110,6 +110,21 @@ volatile uint32_t native_ufs_hce = 0;
 volatile uint32_t native_ufs_utrl_ready = 0;
 volatile uint32_t native_ufs_uic_status = 0;
 volatile uint32_t native_ufs_uic_result = 0;
+// What the transfer path was doing when a boot stopped inside it. The lock pair names the thread
+// that holds the host lock and the one waiting for it; the last_* counters are the final poll's
+// readings; diag_step names the register access in progress (1 doorbell 0x58, 2 interrupt status
+// 0x20, 3 completion word, 4 the inter-poll delay, 0 nothing in flight) with that command's
+// opcode, type and LBA. BootProgress prints them beside the block count.
+volatile uint64_t native_ufs_lock_owner = 0;
+volatile uint64_t native_ufs_lock_wait = 0;
+volatile uint32_t native_ufs_last_polls = 0;
+volatile uint32_t native_ufs_last_db = 0;
+volatile uint32_t native_ufs_last_is = 0;
+volatile uint32_t native_ufs_last_ocs = 0;
+volatile uint32_t native_ufs_diag_step = 0;
+volatile uint32_t native_ufs_diag_opcode = 0;
+volatile uint32_t native_ufs_diag_type = 0;
+volatile uint64_t native_ufs_diag_lba = 0;
 }
 
 class NativeUfs : public IOService {
@@ -1113,6 +1128,25 @@ static void hostWrite (unsigned offset, uint32_t value)
   __asm__ volatile ("dsb sy" ::: "memory");
 }
 
+// A bounded busy-wait for the transfer poll. delay_for_interval() blocks whenever
+// cpu_idle_latency is 0, which is this board's state, so an IODelay parks the caller on the
+// local core's timer queue. A core that stops taking its timer then strands the poll loop
+// forever: 2026-11-08 measured a boot frozen at 611 blocks with the transfer parked exactly
+// in that delay. Two microseconds of cntpct costs less than that risk.
+static void spinMicroseconds (unsigned us)
+{
+  uint64_t freq, start, now;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq));
+  if (!freq) {
+    return;
+  }
+  const uint64_t want = uint64_t (us) * freq / 1000000u;
+  __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (start));
+  do {
+    __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (now));
+  } while (now - start < want);
+}
+
 #include "RootQueue.h"
 
 #include "RootCommands.h"
@@ -1832,6 +1866,7 @@ static bool ufsHasAncestor (IORegistryEntry *entry, const IORegistryEntry *ances
 // reachable from our exact whole-userdata block device.
 static void renameWholeUserdataThread (void *, wait_result_t)
 {
+  thread_set_thread_name (current_thread (), "ufs_rename");
   NativeUfsWholeUserdataBlock *device = gWholeUserdataDevice;
   if (!device) return;
   device->retain ();
@@ -2461,6 +2496,7 @@ static void discardPendingWindow (unsigned index)
 
 static void publishThread (void *, wait_result_t)
 {
+  thread_set_thread_name (current_thread (), "ufs_publish");
   struct Operations {
     bool start (unsigned index) {
       NativeUfsBlock *device = gPendingDevice[index];
@@ -2519,6 +2555,7 @@ extern int nprocs;
 
 static void statsThread (void *argument, wait_result_t)
 {
+  thread_set_thread_name (current_thread (), "ufs_stats");
   unsigned delay = static_cast<unsigned> (reinterpret_cast<uintptr_t> (argument));
   IOSleep (delay * 1000);
   panic ("NATIVE_UFS memory snapshot after %u s\n"
@@ -2536,6 +2573,7 @@ static char gMediaReport[3000];
 
 static void mediaReportThread (void *, wait_result_t)
 {
+  thread_set_thread_name (current_thread (), "ufs_media_report");
   unsigned count = 0;
   for (unsigned tick = 0; tick < 200; tick++) {      // up to 20 s
     OSDictionary *matching = IOService::serviceMatching ("IOMedia");

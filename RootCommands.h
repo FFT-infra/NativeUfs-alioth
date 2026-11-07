@@ -1,16 +1,33 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Shared production command path. Included inside the root transport namespace.
 // The host harness replaces only MMIO, DMA synchronization, clock and lock primitives.
+/* The calling kernel thread's id, for the lock-owner record. Kept in one place so the host
+ * harnesses can supply their own definition instead of pulling in <kern/thread.h>. */
+static uint64_t ufsThreadId (void)
+{
+  return (uint64_t)thread_tid (current_thread ());
+}
+
 struct HardwareTransferPort {
   uint64_t deadline;
-  uint32_t doorbell () { return read32 (gHost.hc, 0x58); }
-  uint32_t interrupt () { return read32 (gHost.hc, 0x20); }
+  uint32_t lastDb = 0, lastIs = 0, lastOcs = 0;
+  uint32_t doorbell () { native_ufs_diag_step = 1; return lastDb = read32 (gHost.hc, 0x58); }
+  uint32_t interrupt () { native_ufs_diag_step = 2; return lastIs = read32 (gHost.hc, 0x20); }
   uint32_t completedOcs () {
+    native_ufs_diag_step = 3;
     cacheInvalidate (gHost.virt, 64);
-    return *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
+    return lastOcs = *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
   }
   bool expired () { return mach_absolute_time () >= deadline; }
-  void delay () { IODelay (2); }
+  void delay () {
+    /* A transfer that stops inside this loop is the interesting case: publish the counters here so
+     * the console shows how far the last poll got. */
+    native_ufs_last_db = lastDb;
+    native_ufs_last_is = lastIs;
+    native_ufs_last_ocs = lastOcs;
+    native_ufs_diag_step = 4;
+    spinMicroseconds (2);
+  }
 };
 
 static void putBe32 (uint8_t *at, uint32_t value)
@@ -79,12 +96,22 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
   HardwareTransferPort port;
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+  native_ufs_diag_type = gRootDiagnostic.type;
+  native_ufs_diag_opcode = gRootDiagnostic.opcode;
+  native_ufs_diag_lba = gRootDiagnostic.lba;
+  native_ufs_diag_step = 0;
   hostWrite (0x58, 1);
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
   gRootDiagnostic.isSeen = state.interruptSeen;
+  /* Published before the status is returned, so a transfer that later stops mid-poll still
+   * leaves the counters of the last one it started. */
+  native_ufs_last_polls = state.polls;
+  native_ufs_last_db = state.doorbellSeen;
+  native_ufs_last_is = state.interruptSeen;
+  native_ufs_last_ocs = state.ocs;
   *ocs = state.ocs;
   if (end != UfsTransferEnd::Completed) {
     // No cancel/reset/retry: the controller may still own the buffer, even
@@ -224,7 +251,9 @@ static IOReturn hostReadCapacity (uint8_t lun, UfsReadCapacity *capacity)
   capacity->blockBytes = 0;
   capacity->scsi = 0xffff;
   capacity->ocs = 0xff;
+  native_ufs_lock_wait = ufsThreadId ();
   IOLockLock (gHost.lock);
+  native_ufs_lock_owner = native_ufs_lock_wait;
   uint8_t cdb[10] = { 0x25 };
   uint32_t scsi = 0;
   IOReturn status = hostScsi (lun, cdb, 10, true, 8, 1000000, &scsi);
@@ -234,6 +263,7 @@ static IOReturn hostReadCapacity (uint8_t lun, UfsReadCapacity *capacity)
     capacity->lastLba = loadBe32 (gHost.virt + kDataOffset);
     capacity->blockBytes = loadBe32 (gHost.virt + kDataOffset + 4);
   }
+  native_ufs_lock_owner = 0;
   IOLockUnlock (gHost.lock);
   return status;
 }
@@ -273,7 +303,9 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
     return kIOReturnBadArgument;
   }
+  native_ufs_lock_wait = ufsThreadId ();
   IOLockLock (gHost.lock);
+  native_ufs_lock_owner = native_ufs_lock_wait;
   gRootDiagnostic.lba = lba;
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
@@ -282,6 +314,7 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   if (status == kIOReturnSuccess) {
     memcpy (dst, gHost.virt + kDataOffset, blocks * 4096U);
   }
+  native_ufs_lock_owner = 0;
   IOLockUnlock (gHost.lock);
   return status;
 }
@@ -347,8 +380,11 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   if (!hostWrite4kArgs (lun, lba, blocks, src)) {
     return kIOReturnBadArgument;
   }
+  native_ufs_lock_wait = ufsThreadId ();
   IOLockLock (gHost.lock);
+  native_ufs_lock_owner = native_ufs_lock_wait;
   IOReturn status = hostWrite4kLocked (lun, lba, blocks, src, fua);
+  native_ufs_lock_owner = 0;
   IOLockUnlock (gHost.lock);
   return status;
 }
@@ -367,11 +403,14 @@ static IOReturn hostWrite4kTry (uint8_t lun, uint64_t lba, uint32_t blocks, cons
   if (!hostWrite4kArgs (lun, lba, blocks, src)) {
     return kIOReturnBadArgument;
   }
+  native_ufs_lock_wait = ufsThreadId ();
   if (!IOLockTryLock (gHost.lock)) {
     *busy = true;
     return kIOReturnBusy;
   }
+  native_ufs_lock_owner = native_ufs_lock_wait;
   IOReturn status = hostWrite4kLocked (lun, lba, blocks, src, false);
+  native_ufs_lock_owner = 0;
   IOLockUnlock (gHost.lock);
   return status;
 }
@@ -380,10 +419,13 @@ static IOReturn hostWrite4kTry (uint8_t lun, uint64_t lba, uint32_t blocks, cons
 static IOReturn hostSyncCache (void)
 {
   if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gRootOpen)) return kIOReturnNotReady;
+  native_ufs_lock_wait = ufsThreadId ();
   IOLockLock (gHost.lock);
+  native_ufs_lock_owner = native_ufs_lock_wait;
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
+  native_ufs_lock_owner = 0;
   IOLockUnlock (gHost.lock);
   return status;
 }
@@ -393,10 +435,13 @@ static IOReturn hostSyncCacheTry (bool *busy)
 {
   *busy = false;
   if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gRootOpen)) return kIOReturnNotReady;
+  native_ufs_lock_wait = ufsThreadId ();
   if (!IOLockTryLock (gHost.lock)) { *busy = true; return kIOReturnBusy; }
+  native_ufs_lock_owner = native_ufs_lock_wait;
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
   IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
+  native_ufs_lock_owner = 0;
   IOLockUnlock (gHost.lock);
   return status;
 }

@@ -36,12 +36,25 @@ static void IODelay(uint32_t us) {
   uint64_t end; clock_interval_to_deadline(us,1,&end);
   while (mach_absolute_time()<end) asm volatile("yield");
 }
+static void spinMicroseconds(uint32_t us) {
+  uint64_t freq,start,now; asm volatile("mrs %0, cntfrq_el0":"=r"(freq));
+  if(!freq)return;
+  const uint64_t want=uint64_t(us)*freq/1000000;
+  asm volatile("isb; mrs %0, cntpct_el0":"=r"(start));
+  do { asm volatile("isb; mrs %0, cntpct_el0":"=r"(now)); } while(now-start<want);
+}
 // Single EL1 CPU, interrupts masked. This does not test XNU lock scheduling.
 static void IOLockLock(void *) {}
 static void IOLockUnlock(void *) {}
 static IOReturn recordTransport(IOReturn result,uint32_t ocs) {
   gRootDiagnostic.result=result; gRootDiagnostic.ocs=ocs; return result;
 }
+// The transfer diagnostics RootCommands.h writes; the kernel build defines these in NativeUfs.cpp.
+static volatile uint32_t native_ufs_diag_step, native_ufs_diag_opcode, native_ufs_diag_type;
+static volatile uint64_t native_ufs_diag_lba;
+static volatile uint32_t native_ufs_last_polls, native_ufs_last_db, native_ufs_last_is, native_ufs_last_ocs;
+static volatile uint64_t native_ufs_lock_owner, native_ufs_lock_wait;
+static uint64_t ufsThreadId (void) { return 0; }
 #include "../RootCommands.h"
 #include "../RootQueue.h"
 
